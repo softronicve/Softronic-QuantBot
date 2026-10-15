@@ -1,0 +1,7 @@
+# Allowlist: the image only gets what the bot needs to run.
+# In particular .env (credentials) is never part of the build context.
+*
+!requirements.txt
+!config/
+!src/
+**/__pycache__

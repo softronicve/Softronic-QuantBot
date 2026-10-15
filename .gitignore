@@ -1,0 +1,11 @@
+# Credentials and local configuration: never committed
+.env
+
+# Environments and caches
+.venv/
+__pycache__/
+.pytest_cache/
+
+# Bot state: cycles run, paper account, reports, downloaded candles.
+# Only the folder at the root: src/data/ is code.
+/data/

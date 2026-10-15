@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Softronic QuantBot</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <h1>Softronic QuantBot</h1>
+      <p>Channel breakout · long only · Binance USDT-M Futures</p>
+    </div>
+    <label class="command" title="Type a command and press Enter. Shortcut: /">
+        <span aria-hidden="true">&gt;</span>
+        <input id="command" type="text" placeholder="NEAR 1H · POS · NEWS · ?" aria-label="Command line"
+               autocomplete="off" autocapitalize="characters" spellcheck="false">
+      </label>
+    <div class="top-side">
+      <div class="clocks" role="group" aria-label="Current time and next cycle">
+        <span></span><span class="zone">UTC</span><span class="zone">Local</span><span class="pad"></span>
+        <span class="row">Now</span><span id="clock-utc">—</span><span id="clock-local">—</span><span class="pad"></span>
+        <span class="row">Next cycle</span><span id="next-utc">—</span><span id="next-local">—</span>
+        <span id="next-in" class="countdown"></span>
+      </div>
+      <div class="top-right">
+        <span id="live" class="live off">—</span>
+        <span id="mode" class="badge">—</span>
+        <span id="cycle" class="cycle">No data</span>
+        <a id="download" class="button" href="/api/report.md" download>Download today's audit report</a>
+      </div>
+    </div>
+  </header>
+
+  <section id="context" class="context" data-panel="context" aria-label="Market context"></section>
+
+  <div id="notices" class="notices" role="status"></div>
+
+  <main>
+    <section class="metrics" id="portfolio" data-panel="portfolio" aria-label="Portfolio"></section>
+
+    <section class="panel" data-panel="positions" aria-labelledby="positions-title">
+      <div class="panel-head">
+        <h2 id="positions-title">Open positions</h2>
+        <p class="hint" id="positions-hint"></p>
+      </div>
+      <div class="scroll">
+        <table id="positions">
+          <thead>
+            <tr>
+              <th>Coin</th><th class="num">Buy</th><th class="num">Price now</th><th class="num">P&amp;L</th>
+              <th class="num">Sell at stop</th><th class="num">Sell at channel</th><th>What the bot does</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="explain">
+        <p><b>When it sells.</b> On the <b>stop</b>: if the price touches the position's stop, which is set at the buy
+          and does not move. On the <b>exit channel</b>: once a day, at 00:01:30 UTC, if the daily candle has closed
+          below the low of the previous <span id="exit-period">10</span> candles; that level is recalculated every day.
+          If neither happens, the position <b>is held (HOLD)</b>. The bot does not sell for having made
+          a given amount: it lets the rise run until the price turns.</p>
+        <p id="stop-note"></p>
+      </div>
+    </section>
+
+    <section class="panel" data-panel="curve" aria-labelledby="curve-title">
+      <div class="panel-head">
+        <h2 id="curve-title">Equity curve</h2>
+        <p class="hint" id="curve-hint"></p>
+      </div>
+      <div class="metrics inner" id="curve-stats"></div>
+      <div class="curve">
+        <div id="equity-chart" class="chart small"></div>
+        <ul class="legend">
+          <li><span class="swatch equity"></span>Account at market price</li>
+          <li><span class="swatch benchmark"></span>BTC at the same exposure</li>
+        </ul>
+        <h3>Drawdown from peak</h3>
+        <div id="drawdown-chart" class="chart tiny"></div>
+      </div>
+      <div class="explain">
+        <p>There is one point per daily cycle (00:01:30 UTC) and, with open positions, one more with the account as of now.
+          <b>BTC at the same exposure</b> is the yardstick: what holding BTC would have returned with, each day, the same
+          percentage of the account the bot had invested, without fees. If the account does not beat that line, picking
+          coins and timing has added nothing over simply holding BTC.</p>
+        <p><b>Drawdown</b> is how far the account is below its previous peak; max drawdown is the worst there has been.</p>
+      </div>
+    </section>
+
+    <section class="panel" data-panel="analytics" aria-labelledby="analytics-title">
+      <div class="panel-head">
+        <h2 id="analytics-title">Portfolio analytics</h2>
+        <p class="hint" id="analytics-hint"></p>
+      </div>
+      <div class="metrics inner" id="trade-stats"></div>
+      <div class="analytics-grid">
+        <div>
+          <h3>P&amp;L by coin</h3>
+          <div class="scroll">
+            <table id="by-symbol">
+              <thead><tr><th>Coin</th><th class="num">Trades</th><th class="num">Wins</th>
+                <th class="num">Closed</th><th class="num">Open</th><th class="num">Total</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <h3>Execution quality</h3>
+          <p class="hint" id="execution-summary"></p>
+          <div class="scroll">
+            <table id="executions">
+              <thead><tr><th>Cycle</th><th>Coin</th><th>Order</th><th class="num">Signal close</th>
+                <th class="num">Price</th><th class="num">Cost</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="corr">
+        <div class="corr-head">
+          <h3>Correlation between coins</h3>
+          <div class="segmented" id="corr-scope" role="group" aria-label="Coins in the matrix">
+            <button type="button" data-scope="focus" aria-pressed="true">Positions and majors</button>
+            <button type="button" data-scope="all" aria-pressed="false">Whole basket</button>
+          </div>
+          <div class="segmented" id="corr-days" role="group" aria-label="Correlation days">
+            <button type="button" data-days="30" aria-pressed="false">30 d</button>
+            <button type="button" data-days="60" aria-pressed="true">60 d</button>
+            <button type="button" data-days="90" aria-pressed="false">90 d</button>
+          </div>
+        </div>
+        <p class="hint" id="corr-hint"></p>
+        <div class="scroll"><div id="corr-matrix" class="corr-matrix"></div></div>
+      </div>
+      <div class="explain">
+        <p>These figures describe what already happened. With few trades they say nothing about the strategy: a figure
+          only starts to count with dozens of closed trades. <b>Correlation</b> runs from −1 to +1: near +1, two
+          coins rise and fall together, and holding both does not spread the risk.</p>
+      </div>
+    </section>
+
+    <details class="panel glossary">
+      <summary>What each figure means</summary>
+      <dl>
+        <dt>Balance</dt>
+        <dd>The realized balance: the starting capital plus what was won or lost on trades already closed, minus
+          fees. It does not change while a position stays open.</dd>
+        <dt>Account at current prices (equity)</dt>
+        <dd>The balance plus what the open positions are winning or losing right now. It is what would be left if
+          everything were sold at this moment.</dd>
+        <dt>Notional value</dt>
+        <dd>The market value of the positions: units × price. "0.25x" means 25 % of the balance is invested.
+          The limit is 1x: it never buys more than the account holds, so there is no leverage.
+          Each coin is also capped at 10 % of the balance.</dd>
+        <dt>Portfolio heat (open risk)</dt>
+        <dd>What would be lost if <em>all</em> positions fell to their stop at once, in % of the balance. It is the
+          planned worst case, not a current loss. If a new buy would push it above the limit, the buy is not made.</dd>
+        <dt>Margin used</dt>
+        <dd>The part of the balance locked as collateral for the positions. At leverage 1 it is their full value.</dd>
+        <dt>Entry channel · proximity · strength</dt>
+        <dd>The entry channel is the high of the previous 20 daily candles: it buys when a candle closes above
+          it. Proximity is how far the close is from that high, and strength is how many ATR it closed above it.</dd>
+        <dt>ATR and stop</dt>
+        <dd>ATR is how much the coin moves on a normal day. The stop goes 2 ATR below the close it buys at,
+          and the size is calculated so that hitting it costs about 1 % of the balance.</dd>
+        <dt>HOLD</dt>
+        <dd>Do nothing: with no position, wait for a breakout; with a position, keep it.</dd>
+      </dl>
+    </details>
+
+    <section class="panel" data-panel="market" aria-labelledby="radar-title">
+      <div class="panel-head">
+        <h2 id="radar-title">Basket radar</h2>
+        <p class="hint">In each tile: on top, today's move; in large type, how far it is now from its
+          20-day high; below, that distance at yesterday's close. Click a coin to inspect it; in the
+          list, click a header to sort.</p>
+      </div>
+      <p class="preview" id="radar-preview"></p>
+      <div id="heatmap" class="heatmap"></div>
+      <p class="breadth" id="breadth"></p>
+      <div class="list-tools">
+        <input id="list-search" type="search" placeholder="Search coin" aria-label="Search coin" autocomplete="off">
+        <div class="segmented" id="list-filter" role="group" aria-label="List filter">
+          <button type="button" data-filter="all" aria-pressed="true">All</button>
+          <button type="button" data-filter="held" aria-pressed="false">In position</button>
+          <button type="button" data-filter="near" aria-pressed="false">Near breakout</button>
+          <button type="button" data-filter="up" aria-pressed="false">Up today</button>
+        </div>
+        <span class="hint" id="list-count"></span>
+      </div>
+      <div class="scroll">
+        <table id="radar" class="market">
+          <thead>
+            <tr class="groups">
+              <th colspan="2"></th>
+              <th colspan="9" class="group now">Now</th>
+              <th colspan="3" class="group" id="th-cycle">Last cycle</th>
+            </tr>
+            <tr id="list-head">
+              <th class="num" data-sort="rank" title="Rank by 24-hour volume within the basket">#</th>
+              <th data-sort="symbol">Coin</th>
+              <th class="num now" data-sort="price">Price</th>
+              <th class="num now" data-sort="day" title="Since the daily close at 00:00 UTC">Today</th>
+              <th class="num now" data-sort="h24" title="Last 24 hours">24 h</th>
+              <th class="num now" data-sort="d7">7 d</th>
+              <th class="num now" data-sort="d30">30 d</th>
+              <th class="num now" data-sort="volume" title="Volume traded in 24 hours, in USDT">24 h vol.</th>
+              <th class="num now" data-sort="funding" title="Funding for the current period: if positive, longs pay it; if negative, they receive it">Funding</th>
+              <th class="num now" data-sort="proximity" title="Distance from the current price to the 20-day high it will have to beat in the next cycle">To its high</th>
+              <th class="now">30 days</th>
+              <th class="num" data-sort="cycle" title="Distance from yesterday's close to its 20-day high">Proximity</th>
+              <th class="num" data-sort="strength" title="How many ATR it closed above (or below) its high">Strength</th>
+              <th data-sort="decision">Decision</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel inspector" data-panel="inspector" aria-labelledby="inspector-title">
+      <div class="panel-head">
+        <h2 id="inspector-title">Asset inspector</h2>
+        <div class="inspector-tools">
+          <div class="segmented" id="timeframes" role="group" aria-label="Candle interval"></div>
+          <label class="picker">Coin <select id="symbol"></select></label>
+        </div>
+      </div>
+      <div class="inspector-grid">
+        <div>
+          <p class="hint chart-note" id="chart-note"></p>
+          <div id="chart" class="chart"></div>
+          <ul class="legend">
+            <li><span class="swatch entry"></span><span id="legend-entry">Entry channel</span></li>
+            <li><span class="swatch exit"></span><span id="legend-exit">Exit channel</span></li>
+            <li><span class="swatch stop"></span><span id="legend-stop">Stop</span></li>
+          </ul>
+          <p class="hint" id="levels"></p>
+          <div class="depth" id="depth-panel">
+            <div>
+              <h3>Order book <b class="pair" id="book-pair"></b> <span id="book-status" class="live off">—</span></h3>
+              <div id="book" class="book"></div>
+            </div>
+            <div>
+              <h3>Trade tape <b class="pair" id="tape-pair"></b></h3>
+              <div id="tape" class="tape"></div>
+            </div>
+            <div>
+              <h3>Derivatives and size <b class="pair" id="derivatives-pair"></b></h3>
+              <dl id="derivatives" class="facts"></dl>
+            </div>
+          </div>
+        </div>
+        <div class="math">
+          <h3>Transparent math</h3>
+          <p id="math-caption" class="hint"></p>
+          <dl id="math"></dl>
+          <div id="position"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" data-panel="news" aria-labelledby="news-title">
+      <div class="panel-head">
+        <h2 id="news-title">News and calendar</h2>
+        <p class="hint" id="news-hint"></p>
+      </div>
+      <div class="news-grid">
+        <div>
+          <div class="news-tools">
+            <h3>Headlines</h3>
+            <div class="segmented" id="news-filter" role="group" aria-label="Headline filter">
+              <button type="button" data-news="all" aria-pressed="true">All</button>
+              <button type="button" data-news="basket" aria-pressed="false">Basket</button>
+              <button type="button" data-news="coin" aria-pressed="false" id="news-coin">Coin</button>
+            </div>
+          </div>
+          <ul id="news" class="news"></ul>
+        </div>
+        <div>
+          <h3>This week's calendar</h3>
+          <ul id="calendar" class="calendar"></ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" data-panel="audit" aria-labelledby="audit-title">
+      <div class="panel-head">
+        <h2 id="audit-title">Audit center</h2>
+        <p class="hint">Each cycle leaves a report in Markdown and JSON, with questions already written for an LLM.</p>
+      </div>
+      <div class="audit-grid">
+        <div>
+          <h3>Latest cycles</h3>
+          <div class="scroll">
+            <table id="history">
+              <thead><tr><th>Date</th><th>Status</th><th>Buys</th><th>Closes</th><th>No trade</th><th>Report</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <h3>Closed trades</h3>
+          <div class="scroll">
+            <table id="trades">
+              <thead><tr><th>Symbol</th><th>Closed</th><th>Reason</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">P&amp;L</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>Read-only. Decisions and positions are those of the last daily cycle; prices, position P&amp;L
+    and the radar's "Now" columns update every 10 seconds. The current figures are a preview:
+    the bot only decides on a daily candle that has already closed.</footer>
+
+  <template id="sparkline"><svg viewBox="0 0 96 26" role="img"><polyline></polyline></svg></template>
+
+  <dialog id="help" aria-labelledby="help-title">
+    <h2 id="help-title">Shortcuts and commands</h2>
+    <div class="help-grid">
+      <div>
+        <h3>Keyboard</h3>
+        <dl class="keys">
+          <dt><kbd>/</kbd></dt><dd>Go to the command line</dd>
+          <dt><kbd>j</kbd> <kbd>k</kbd></dt><dd>Next and previous coin in the list</dd>
+          <dt><kbd>1</kbd>…<kbd>5</kbd></dt><dd>5 min, 15 min, 1 h, 4 h and 1 day candles</dd>
+          <dt><kbd>p</kbd> <kbd>e</kbd> <kbd>a</kbd></dt><dd>Positions, equity curve and analytics</dd>
+          <dt><kbd>m</kbd> <kbd>g</kbd> <kbd>n</kbd></dt><dd>Market, chart and news</dd>
+          <dt><kbd>t</kbd></dt><dd>Back to top</dd>
+          <dt><kbd>?</kbd></dt><dd>This help</dd>
+          <dt><kbd>Esc</kbd></dt><dd>Close the help or leave the command line</dd>
+        </dl>
+      </div>
+      <div>
+        <h3>Command line</h3>
+        <dl class="keys">
+          <dt><code>NEAR</code></dt><dd>Opens that coin in the chart</dd>
+          <dt><code>NEAR 5M</code></dt><dd>The same, in 5-minute candles (<code>15M</code>, <code>1H</code>, <code>4H</code>, <code>1D</code>)</dd>
+          <dt><code>POS</code> <code>EVO</code> <code>ANA</code></dt><dd>Positions, equity curve and analytics</dd>
+          <dt><code>MKT</code> <code>GP</code> <code>NEWS</code> <code>AUD</code></dt><dd>Market, chart, news and audit</dd>
+          <dt><code>WIN GP</code></dt><dd>Opens that section in another window (works with any of them)</dd>
+          <dt><code>?</code></dt><dd>This help</dd>
+        </dl>
+      </div>
+    </div>
+    <p class="hint">Each section also has a button to open it in its own window and spread the dashboard across several monitors.</p>
+    <form method="dialog"><button class="button" type="submit">Close</button></form>
+  </dialog>
+
+  <script src="/static/lightweight-charts.js"></script>
+  <script src="/static/app.js"></script>
+  <script src="/static/analytics.js"></script>
+  <script src="/static/context.js"></script>
+  <script src="/static/book.js"></script>
+  <script src="/static/shell.js"></script>
+</body>
+</html>

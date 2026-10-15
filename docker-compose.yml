@@ -1,0 +1,68 @@
+name: softronic-quantbot
+
+# One container: the daily cycle of the basket and its dashboard.
+# As shipped it runs in DRY_RUN: real prices, paper account, no order leaves the machine.
+#
+# The dashboard is published on localhost only. To open it from another machine use an
+# SSH tunnel, e.g.  ssh -L 8770:127.0.0.1:8770 user@server  and browse http://localhost:8770
+
+services:
+  quantbot:
+    build: .
+    image: softronic-quantbot:latest
+    container_name: softronic-quantbot
+    # The cycle waits for 00:01:30 UTC every day and serves the dashboard from the same process.
+    command: ["python", "-m", "src.engine.daily_runner", "--panel"]
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    # Settings arrive at run time; they are not baked into the image.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      BOT_STATE_DIR: /app/data
+      BOT_LOG_JSON: "true"
+      # Paper trading whatever the .env says. To move to TESTNET, change the mode
+      # here and delete the two lines that blank the keys.
+      BOT_DRY_RUN: "true"
+      BOT_FUTURES__EXECUTION_MODE: DRY_RUN
+      BOT_FUTURES__LIVE_TRADING_ACKNOWLEDGED: "false"
+      # DRY_RUN only reads public data, so the container gets no credentials
+      # even if they are in the .env file.
+      BOT_FUTURES__API_KEY: ""
+      BOT_FUTURES__API_SECRET: ""
+      # Inside the container the dashboard listens on every interface; outside
+      # it is only published on localhost.
+      BOT_DASHBOARD__HOST: 0.0.0.0
+      BOT_FUTURES__DASHBOARD_PORT: "8770"
+    ports:
+      - "127.0.0.1:8770:8770"
+    cpus: 1.0
+    mem_limit: 1024m
+    memswap_limit: 1024m
+    pids_limit: 128
+    # Cycle state, paper account and reports: they outlive the container.
+    volumes:
+      - bot-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8770/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  bot-data:
