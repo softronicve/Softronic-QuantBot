@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+from src.atomic_file import write_atomically
 from src.engine.orchestrator import CLOSE_LONG, OPEN_LONG, OrderIntent, entry_priority
 from src.execution.binance_futures_executor import DONE, FuturesAccount, FuturesPosition, MarketRules
 from src.risk.portfolio_risk import PortfolioRiskManager
@@ -413,10 +414,8 @@ def _clean(value: Any) -> Any:
 
 def _write(path: Path, text: str) -> None:
     """Atomic write: a reader sees the old file or the new one, never a half-written one."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(text, encoding="utf-8")
-    temporary.replace(path)
+    # The .md and the .json of a day share a stem: the temporary name keeps the whole name.
+    write_atomically(path, text, path.with_name(path.name + ".tmp"))
 
 
 # --- Questions for the LLM ---------------------------------------------------

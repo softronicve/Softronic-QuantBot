@@ -22,7 +22,7 @@ from typing import Any
 import pandas as pd
 from loguru import logger
 
-from src.risk.portfolio_risk import APPROVED, ActivePosition, PortfolioRiskManager
+from src.risk.portfolio_risk import ActivePosition, PortfolioRiskManager
 from src.risk.turtle_engine import RiskError
 from src.strategies.trend_breakout import (
     Action,

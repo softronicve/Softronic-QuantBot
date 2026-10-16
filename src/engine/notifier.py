@@ -26,11 +26,15 @@ from typing import Any, Protocol
 from loguru import logger
 
 from config.settings import Settings, get_settings
+from src.atomic_file import write_atomically
 from src.console import configure_logging
 from src.execution.binance_futures_executor import (
+    CLOSED_UNPROTECTED,
     DONE,
     NO_POSITION,
+    PARTIAL_CLOSE,
     STOP_FAILED_CLOSED,
+    STOP_RESTORED,
     UNPROTECTED,
     FuturesAccount,
     FuturesPosition,
@@ -50,6 +54,14 @@ PROBLEMS = {
     STOP_FAILED_CLOSED: "bought, the stop could not be placed and it was closed",
     "TOO_LATE": "not bought: the cycle started too late",
     "CLOSE_FAILED": "not bought: a sell failed first",
+    PARTIAL_CLOSE: "the sell filled only in part; the rest stays open with its stop",
+    "ENTRIES_DECIDED": "not bought: the signal showed up when the cycle ran again, after the day's buys were settled",
+}
+# A position found without a stop on the exchange, and what was done about it.
+REPAIRS = {
+    STOP_RESTORED: "had no stop on the exchange; it has been placed again",
+    CLOSED_UNPROTECTED: "had no stop and could not be protected; it has been closed",
+    UNPROTECTED: "HAS NO STOP on the exchange and it could not be fixed: check it now",
 }
 
 Transport = Callable[[str, Mapping[str, str], float], Any]
@@ -149,10 +161,7 @@ class TelegramNotifier:
             return
         keys = [*self._sent_keys(), key][-REMEMBERED_KEYS:]
         try:
-            self._memory.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self._memory.with_suffix(".tmp")
-            temporary.write_text(json.dumps(keys), encoding="utf-8")
-            temporary.replace(self._memory)
+            write_atomically(self._memory, json.dumps(keys))
         except OSError as error:
             logger.warning("Could not record the alert sent ({}); it might be repeated", error)
 
@@ -243,10 +252,18 @@ def cycle_message(
     if stopped:
         lines.append("STOPS")
         lines += [f"• {_coin(trade['symbol'])}: at {_price(trade['exit_price'])}{_result(trade)}" for trade in stopped]
-    if failed:
+    repaired = list(summary.get("protected", []))
+    blind = list(summary.get("without_data", []))
+    retired = list(summary.get("untradable", []))
+    if failed or repaired or blind or retired:
         lines.append("ATTENTION")
+        lines += [f"• {_coin(order['symbol'])}: {REPAIRS.get(str(order.get('status')), _problem(order))}"
+                  for order in repaired]
         lines += [f"• {_coin(order['symbol'])}: {_problem(order)}" for order in failed]
-    eventful = bool(bought or sold or stopped or failed)
+        lines += [f"• {_coin(symbol)}: no candles today; its exit could not be checked" for symbol in blind]
+        lines += [f"• {_coin(symbol)}: Binance no longer trades it (delisting); its exit is still checked with the "
+                  "last known rules" for symbol in retired]
+    eventful = bool(bought or sold or stopped or failed or repaired or blind or retired)
     if not eventful:
         lines.append("No changes: no buys or sells.")
     if account is not None and positions is not None:

@@ -6,6 +6,7 @@ import json
 import re
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
@@ -750,13 +751,73 @@ def test_candles_endpoint_reports_a_failed_read_without_details() -> None:
         assert _get(f"{base}/api/candles?symbol=BTCUSDT&interval=5m")[0] == 404
 
 
-def test_a_failing_snapshot_is_reported_and_not_cached(served: tuple[str, _CountingPanel]) -> None:
+def test_a_failing_snapshot_is_reported_without_details_and_not_cached(served: tuple[str, _CountingPanel]) -> None:
     base, panel = served
-    panel.error = RuntimeError("unreadable disk")
+    panel.error = RuntimeError("/app/data/unreadable disk")
     status, _, body = _get(base + "/api/snapshot")
-    assert status == 500 and json.loads(body) == {"error": "unreadable disk"}
+    assert status == 500 and json.loads(body) == {"error": "could not build the dashboard"}
     panel.error = None
     assert _get(base + "/api/snapshot")[0] == 200 and panel.calls == 2
+
+
+def test_a_stale_snapshot_is_served_while_one_request_rebuilds_it(traded: Path) -> None:
+    class SlowPanel(_CountingPanel):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.gate: threading.Event | None = None
+            self.waiting = threading.Event()
+
+        def snapshot(self) -> dict[str, Any]:
+            if self.gate is not None:
+                self.waiting.set()
+                self.gate.wait(timeout=5)
+            return super().snapshot()
+
+    panel = SlowPanel(traded)
+    server = BasketDashboardServer(("127.0.0.1", 0), panel, cache_seconds=0.0)
+    first = server.snapshot()
+    panel.gate = threading.Event()
+    rebuilt: list[bytes] = []
+    rebuilding = threading.Thread(target=lambda: rebuilt.append(server.snapshot()))
+    rebuilding.start()
+    try:
+        assert panel.waiting.wait(timeout=5)  # the rebuild has started and is waiting on Binance
+        started = time.monotonic()
+        assert server.snapshot() == first and time.monotonic() - started < 1.0
+    finally:
+        panel.gate.set()
+        rebuilding.join(timeout=5)
+        server.server_close()
+
+    panel.gate, panel.error = None, RuntimeError("Binance down")
+    assert len(rebuilt) == 1
+    assert server.snapshot() == rebuilt[0]  # a failed rebuild keeps serving the last good one
+    assert panel.calls == 3
+
+
+@pytest.mark.parametrize(("host", "allowed"), [
+    ("127.0.0.1:8770", True), ("localhost:9000", True), ("LOCALHOST", True), ("[::1]:8770", True),
+    ("localhost.:8770", True), ("evil.example:8770", False), ("127.0.0.1.evil.example", False), ("", False),
+])
+def test_only_requests_addressed_to_this_machine_are_answered(
+    served: tuple[str, _CountingPanel], host: str, allowed: bool,
+) -> None:
+    base, _ = served
+    request = urllib.request.Request(base + "/api/snapshot", headers={"Host": host})
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            status = response.status
+    except urllib.error.HTTPError as error:
+        status = error.code
+    assert (status == 200) is allowed and (allowed or status == 403)
+
+
+def test_an_unreadable_upstream_answer_is_a_gateway_error_not_a_bad_request() -> None:
+    def feed(symbol: str) -> dict[str, Any]:
+        raise json.JSONDecodeError("Expecting value", "<html>", 0)
+
+    for base in _serving(derivatives=LiveBySymbol(feed, ttl_seconds=60.0)):
+        assert _get(f"{base}/api/derivatives?symbol=NEARUSDT")[0] == 502
 
 
 def test_report_download(served: tuple[str, _CountingPanel], traded: Path) -> None:
@@ -888,3 +949,19 @@ def test_main_follows_the_testnet_account(tmp_path: Path, monkeypatch: pytest.Mo
     # Without outside data: no context and no browser connection; what the server asks Binance for goes on.
     assert (built["panel"]._stream, built["options"]["context"], built["options"]["stream"]) == (None, None, None)
     assert isinstance(built["options"]["candles"], LiveCandles)
+
+
+def test_a_client_that_leaves_mid_answer_is_not_an_error(served: tuple[str, _CountingPanel]) -> None:
+    base, _ = served
+    port = int(base.rsplit(":", 1)[1])
+    log_lines: list[str] = []
+    sink = logger.add(log_lines.append, format="{level}|{message}", level="WARNING")
+    try:
+        for _ in range(5):
+            with socket.create_connection(("127.0.0.1", port)) as connection:
+                connection.sendall(b"GET /api/snapshot HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+        assert _get(base + "/api/snapshot")[0] == 200
+    finally:
+        logger.remove(sink)
+    assert log_lines == []

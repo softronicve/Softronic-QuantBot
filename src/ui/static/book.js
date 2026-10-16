@@ -10,9 +10,13 @@ const DERIVATIVES_MS = 60000;
 // When the book goes out of view (scrolling further down, switching tabs) the connection holds this long:
 // that way coming straight back neither drops it nor reopens it.
 const BOOK_GRACE_MS = 45000;
+// Holding j/k flips through coins many times a second: only the coin it lands on opens connections.
+const SELECT_SETTLE_MS = 250;
 let book = { symbol: null, bids: [], asks: [], trades: [], mode: "off", dirty: false };
 let sockets = [];
 let bookPoll = null;
+let pollInFlight = false;
+let selectSettle = null;
 let bookVisible = false;
 let bookPause = null;
 let streamWorked = false;
@@ -53,17 +57,29 @@ function onStream(symbol, message) {
 }
 
 async function pollBook(symbol) {
+  if (pollInFlight) return;  // a slow server must not pile up requests
+  pollInFlight = true;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), BOOK_POLL_MS * 3);
   try {
-    const response = await fetch(`/api/book?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
+    const response = await fetch(`/api/book?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store", signal: controller.signal });
     if (!response.ok || symbol !== book.symbol) return;
     const data = await response.json();
+    // The coin changed, or the live stream opened, while the answer was on its way.
+    if (symbol !== book.symbol || book.mode === "stream") return;
     book.bids = data.bids;
     book.asks = data.asks;
     book.trades = data.trades.slice().reverse().slice(0, TAPE_ROWS);
+    book.mode = "poll";  // back from a failed poll
     book.dirty = true;
   } catch (error) {
-    book.mode = "off";
-    book.dirty = true;
+    if (symbol === book.symbol && book.mode !== "stream") {
+      book.mode = "off";
+      book.dirty = true;
+    }
+  } finally {
+    clearTimeout(timer);
+    pollInFlight = false;
   }
 }
 
@@ -149,7 +165,7 @@ function renderBook() {
       el("div", { class: "book-row head" }, el("span", { text: "Price" }), el("span", { text: "USDT" }), el("span", { text: "Cumulative" })),
       askRows,
       el("div", { class: "book-mid" }, el("b", { text: price((asks[0][0] + bids[0][0]) / 2) }),
-        el("span", { text: `spread ${price(spread)} (${number(spread / bids[0][0] * 100, 3)} %)` })),
+        el("span", { text: `spread ${number(spread, priceDecimals(bids[0][0]))} (${number(spread / bids[0][0] * 100, 3)} %)` })),
       bidRows,
       el("div", { class: "imbalance", title: "Split of the money resting in the first ten levels of each side" },
         el("i", { style: `width:${imbalance.toFixed(1)}%` }),
@@ -238,15 +254,20 @@ new IntersectionObserver((entries) => {
 document.addEventListener("visibilitychange", syncBook);
 setInterval(() => { if (book.dirty) renderBook(); }, 250);
 // Picking another coin does switch books; clicking the same one again does not reconnect.
-hooks.select.push(() => {
+function switchBook() {
+  selectSettle = null;
   if (book.symbol === selected && bookConnected()) return;
   if (bookWanted()) startBook(); else { stopBook(); book = { symbol: selected, bids: [], asks: [], trades: [], mode: "off", dirty: true }; }
   loadDerivatives(true);
+}
+hooks.select.push(() => {
+  if (selectSettle) clearTimeout(selectSettle);
+  selectSettle = setTimeout(switchBook, SELECT_SETTLE_MS);
 });
 // If the book was already in view when the first data arrived, it has not been able to connect yet.
 // And if the live connection dropped after having worked, it is retried every minute.
 hooks.full.push(() => {
-  const dropped = book.mode === "poll" && streamWorked;
+  const dropped = streamWorked && book.mode !== "stream";
   if (bookWanted() && (!bookConnected() || book.symbol !== selected || dropped)) startBook();
   loadDerivatives(false);
 });

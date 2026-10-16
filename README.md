@@ -68,7 +68,8 @@ docker compose up -d --build
 The container runs in dry run and serves the dashboard on
 `http://127.0.0.1:8770`. On a remote server, reach it through an SSH tunnel
 (`ssh -L 8770:127.0.0.1:8770 user@server`); it is not meant to be exposed to
-the internet.
+the internet. It only answers requests addressed to `localhost` or `127.0.0.1`,
+so opening it through another hostname or a LAN address returns 403.
 
 Without Docker (Python 3.12 or newer):
 

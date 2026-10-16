@@ -16,6 +16,10 @@ def configure_logging(settings: Settings) -> None:
 
     The file rotates at 5 MB and the five previous ones are kept, so that a
     bot running for weeks with nobody watching does not fill the disk.
+
+    Tracebacks are logged without the values of local variables (``diagnose``)
+    and without the frames above the catch point (``backtrace``): a frame that
+    builds the exchange client holds the API key and secret.
     """
     use_utf8_output()
     logger.remove()
@@ -23,10 +27,10 @@ def configure_logging(settings: Settings) -> None:
         settings.log_file.parent.mkdir(parents=True, exist_ok=True)
         logger.add(
             settings.log_file, level=settings.log_level, serialize=settings.log_json,
-            rotation="5 MB", retention=5, encoding="utf-8",
+            rotation="5 MB", retention=5, encoding="utf-8", backtrace=False, diagnose=False,
         )
     else:
-        logger.add(sys.stderr, level=settings.log_level, serialize=settings.log_json)
+        logger.add(sys.stderr, level=settings.log_level, serialize=settings.log_json, backtrace=False, diagnose=False)
 
 
 def use_utf8_output() -> None:

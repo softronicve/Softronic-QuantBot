@@ -23,6 +23,7 @@ from src.execution.binance_futures_executor import (
     LIVE,
     NO_POSITION,
     NO_RULES,
+    PARTIAL_CLOSE,
     POSITION_EXISTS,
     REJECTED,
     SIMULATED,
@@ -596,6 +597,21 @@ def test_a_position_left_without_stop_is_reported_as_critical(client: FakeFuture
     assert any(line.startswith("CRITICAL|BTCUSDT: POSITION WITHOUT STOP") for line in log)
 
 
+def test_an_unexpected_failure_placing_the_stop_still_closes_the_new_position(client: FakeFuturesClient) -> None:
+    client.fail["futures_create_algo_order"] = [ValueError("unreadable answer")]
+    result = _executor(client).execute_order_intent(_open(), CYCLE)
+    assert result["status"] == STOP_FAILED_CLOSED and "unreadable answer" in result["reason"]
+    assert client.positions == {}
+
+
+@pytest.mark.parametrize("code", [-1021, -1003, -1008])
+def test_a_stop_refused_for_a_passing_reason_is_sent_again(client: FakeFuturesClient, code: int) -> None:
+    client.fail["futures_create_algo_order"] = [api_error(code, "try again")]
+    result = _executor(client).execute_order_intent(_open(), CYCLE)
+    assert result["status"] == FILLED  # not flattened for a clock skew or a rate limit
+    assert len(client.sent("futures_create_algo_order")) == 2 and len(client.algo_orders) == 1
+
+
 # --- Closes ------------------------------------------------------------------
 
 
@@ -999,3 +1015,76 @@ def test_settle_paper_uses_the_exchange_funding_and_only_in_dry_run(client: Fake
     assert executor.settle_paper({}) == []
     assert paper.balance == pytest.approx(10_000.0 - 0.012 * 80_000.0 * 0.0001)
     assert _executor(client).settle_paper({}) == []
+
+
+def test_an_order_refused_for_a_passing_reason_is_sent_again(client: FakeFuturesClient) -> None:
+    _held(client)
+    client.fail["futures_create_order"] = [api_error(-1021, "Timestamp for this request is outside of the recvWindow.")]
+    result = _executor(client).execute_order_intent(_close(), CYCLE)
+    assert result["status"] == FILLED and client.positions == {}
+    first, second = client.sent("futures_create_order")
+    assert first == second  # same client id: the exchange cannot take it twice
+
+
+def test_a_refusal_that_keeps_coming_is_a_rejection(client: FakeFuturesClient) -> None:
+    _held(client)
+    client.fail["futures_create_order"] = [api_error(-1021, "recvWindow") for _ in range(10)]
+    with pytest.raises(OrderRejectedError):
+        _executor(client, retries=2).execute_order_intent(_close(), CYCLE)
+    assert len(client.sent("futures_create_order")) == 3 and "BTCUSDT" in client.positions
+
+
+def test_a_partial_close_keeps_the_stop_on_what_is_left(client: FakeFuturesClient) -> None:
+    _held(client)
+    sell = client.futures_create_order
+
+    def half_filled(**parameters: Any) -> dict[str, Any]:
+        order = sell(**{**parameters, "quantity": "0.005"})
+        order["status"] = "EXPIRED"
+        client.orders[parameters["newClientOrderId"]]["status"] = "EXPIRED"
+        return order
+
+    client.futures_create_order = half_filled  # type: ignore[method-assign]
+    result = _executor(client).execute_order_intent(_close(), CYCLE)
+    assert result["status"] == PARTIAL_CLOSE and result["quantity"] == pytest.approx(0.005)
+    assert client.positions["BTCUSDT"][0] == pytest.approx(0.007)
+    assert [order["algoId"] for order in client.algo_orders] == [77]  # still protected
+
+
+def test_the_daily_refresh_picks_up_changed_rules_and_delistings(client: FakeFuturesClient) -> None:
+    executor = _executor(client)
+    assert set(executor.load_market_rules(["BTCUSDT", "DOGEUSDT"])) == {"BTCUSDT", "DOGEUSDT"}
+    client.symbols["BTCUSDT"] = symbol_info("BTCUSDT", step="0.01", min_qty="0.01", tick="0.10", min_notional="100")
+    client.symbols["DOGEUSDT"] = symbol_info("DOGEUSDT", status="SETTLING")
+    assert executor.load_market_rules(["BTCUSDT", "DOGEUSDT"])["BTCUSDT"].step_size == Decimal("0.001")  # cached
+    rules = executor.load_market_rules(["BTCUSDT", "DOGEUSDT"], refresh=True)
+    assert list(rules) == ["BTCUSDT"] and rules["BTCUSDT"].step_size == Decimal("0.01")
+    result = executor.execute_order_intent(_open("DOGEUSDT", 100.0, 0.2), CYCLE)
+    assert (result["status"], result["reason"]) == (REJECTED, NO_RULES)  # no entries in a contract being delisted
+
+
+def test_a_stop_placed_by_hand_counts_as_protection(client: FakeFuturesClient) -> None:
+    client.positions["BTCUSDT"] = [0.012, 78_000.0]
+    client.algo_orders.append({"algoId": 5, "orderType": "TRAILING_STOP_MARKET", "symbol": "BTCUSDT", "side": "SELL"})
+    executor = _executor(client)
+    executor.load_market_rules(["BTCUSDT"])
+    assert executor.protect_open_positions({"BTCUSDT": 3_000.0}, CYCLE) == []
+    assert client.sent("futures_create_algo_order") == [] and client.sent("futures_create_order") == []
+
+
+def test_no_repair_is_attempted_on_a_hedge_mode_account(client: FakeFuturesClient) -> None:
+    client.positions["BTCUSDT"] = [0.012, 78_000.0]
+    client.dual_side = True
+    with pytest.raises(BrokerUnavailableError, match="hedge"):
+        _executor(client).protect_open_positions({"BTCUSDT": 3_000.0}, CYCLE)
+    assert client.sent("futures_create_algo_order") == [] and client.sent("futures_create_order") == []
+
+
+def test_a_restored_stop_goes_at_the_protective_distance_from_the_entry(client: FakeFuturesClient) -> None:
+    client.positions["BTCUSDT"] = [0.012, 78_000.0]
+    executor = _executor(client)
+    executor.load_market_rules(["BTCUSDT"])
+    ((result),) = executor.protect_open_positions({"BTCUSDT": 3_000.05}, CYCLE)
+    assert (result["status"], result["stop_price"]) == ("STOP_RESTORED", 74_999.9)
+    ((stop),) = client.algo_orders
+    assert (stop["triggerPrice"], stop["quantity"], stop["clientAlgoId"]) == ("74999.9", "0.012", "tb-20261009-BTCUSDT-r")

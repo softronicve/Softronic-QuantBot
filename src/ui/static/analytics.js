@@ -4,7 +4,6 @@
 let corrScope = "focus";
 let corrDays = 60;
 const CORR_MAJORS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"];
-const coinOf = (symbol) => symbol.replace(/USDT$/, "");
 const ratio = (value) => (isNumber(value) ? number(value, 2) : "—");
 
 function renderTradeStats(stats) {

@@ -14,6 +14,8 @@ from config.settings import DEFAULT_FUTURES_BASKET, MEASURED_FUTURES_BASKET, Set
 from src.data.candle_loader import DailyCandleLoader
 from src.engine import daily_runner
 from src.engine.daily_runner import (
+    ENTRIES_DECIDED,
+    INCOMPLETE,
     ALREADY_DISPATCHED,
     ALREADY_EXECUTED,
     CLOSE_FAILED,
@@ -33,6 +35,9 @@ from src.engine.orchestrator import CLOSE_LONG, OPEN_LONG
 from src.engine.state_store import DailyStateStore, StateError
 from src.execution.errors import BrokerError, BrokerUnavailableError
 from src.execution.binance_futures_executor import (
+    CLOSED_UNPROTECTED,
+    STOP_FAILED_CLOSED,
+    STOP_RESTORED,
     DRY_RUN,
     FILLED,
     LIVE,
@@ -342,13 +347,42 @@ def test_if_the_exchange_is_down_the_cycle_stays_pending(tmp_path: Path) -> None
     assert rig.run()["status"] == COMPLETED and rig.sent == [("AAAUSDT", OPEN_LONG)]
 
 
-def test_a_held_position_without_candles_is_kept(tmp_path: Path) -> None:
+def test_a_held_position_without_candles_leaves_the_day_open_until_they_arrive(tmp_path: Path) -> None:
     rig = Rig(_client({"AAAUSDT": FALLS, "BBBUSDT": BREAKS}), tmp_path)
     rig.paper.open("AAAUSDT", 5.0, 100.0, 80.0, NOW_MS - DAY_MS)
     rig.client.fail["futures_klines"] = [network_error() for _ in range(4)]
     summary = rig.run()
+    assert summary == {"cycle_date": TODAY, "status": INCOMPLETE, "unresolved": [], "without_data": ["AAAUSDT"]}
+    assert "AAAUSDT" in rig.paper.positions and not rig.store.is_cycle_already_executed(TODAY)
+    assert INCOMPLETE in daily_runner.RETRY
+
+    # The retry finds the candles: the exit is checked and nothing already sent is sent again.
+    summary = rig.run()
+    assert summary["status"] == COMPLETED and summary["without_data"] == []
+    assert [(order["symbol"], order["status"]) for order in summary["closes"]] == [("AAAUSDT", SIMULATED)]
+    assert [order["symbol"] for order in summary["opens"]] == ["BBBUSDT"]
+    assert rig.sent.count(("BBBUSDT", OPEN_LONG)) == 1 and rig.store.is_cycle_already_executed(TODAY)
+
+
+def test_a_stop_hit_in_the_first_attempt_is_still_in_the_day_summary(tmp_path: Path) -> None:
+    rig = Rig(_client({"AAAUSDT": FALLS, "CCCUSDT": FALLS}), tmp_path)
+    rig.paper.open("AAAUSDT", 5.0, 100.0, 80.0, NOW_MS - DAY_MS)
+    rig.paper.open("CCCUSDT", 5.0, 100.0, 99.0, NOW_MS - DAY_MS)  # today's low goes through 99
+    rig.client.fail["futures_klines"] = [network_error() for _ in range(4)]  # AAAUSDT, loaded first
+    assert rig.run()["status"] == INCOMPLETE and "CCCUSDT" not in rig.paper.positions
+
+    summary = rig.run()
+    assert summary["status"] == COMPLETED and summary["stopped"] == ["CCCUSDT"]
+
+
+def test_past_the_entry_deadline_a_day_without_candles_is_closed_and_says_so(tmp_path: Path) -> None:
+    rig = Rig(_client({"AAAUSDT": FALLS, "BBBUSDT": QUIET}), tmp_path, max_entry_delay_minutes=0.0)
+    rig.paper.open("AAAUSDT", 5.0, 100.0, 80.0, NOW_MS - DAY_MS)
+    rig.client.fail["futures_klines"] = [network_error() for _ in range(4)]
+    summary = rig.run()
+    assert summary["status"] == COMPLETED and summary["without_data"] == ["AAAUSDT"]
     assert summary["closes"] == [] and "AAAUSDT" in rig.paper.positions
-    assert summary["holds"] == {"NO_DATA": 1}
+    assert summary["holds"] == {"NO_DATA": 1, "NO_BREAKOUT": 1} and rig.store.is_cycle_already_executed(TODAY)
 
 
 # --- Cycles that never start -------------------------------------------------
@@ -379,20 +413,94 @@ def test_an_empty_basket_is_rejected(tmp_path: Path) -> None:
 # --- Orders that fail --------------------------------------------------------
 
 
-def test_a_failed_close_blocks_the_entries_of_the_day(tmp_path: Path, log: list[str]) -> None:
+def test_a_failed_close_blocks_the_entries_and_the_day_is_retried(tmp_path: Path, log: list[str]) -> None:
     client = _client({"AAAUSDT": BREAKS, "BBBUSDT": FALLS})
     _hold_on_exchange(client, "BBBUSDT")
     client.fail["futures_create_order"] = [api_error(-4131, "PERCENT_PRICE filter limit")]
     rig = Rig(client, tmp_path, mode=TESTNET)
     summary = rig.run()
 
+    assert summary == {"cycle_date": TODAY, "status": INCOMPLETE, "unresolved": ["BBBUSDT"], "without_data": []}
+    assert rig.sent == [("BBBUSDT", CLOSE_LONG)]  # the entry waits for the close
+    assert list(client.positions) == ["BBBUSDT"] and len(client.algo_orders) == 1  # still under its stop
+    assert not rig.store.is_cycle_already_executed(TODAY)
+    assert rig.store.dispatched(TODAY)["BBBUSDT:CLOSE_LONG"]["status"] == ERROR
+    assert any(line.startswith("ERROR|BBBUSDT: CLOSE_LONG was not executed") for line in log)
+
+    summary = rig.run()  # five minutes later the exchange takes the close
+    assert [(order["symbol"], order["status"]) for order in summary["closes"]] == [("BBBUSDT", FILLED)]
+    # As in a cycle run in one go, a day whose close failed buys nothing.
+    assert [(order["symbol"], order["status"]) for order in summary["opens"]] == [("AAAUSDT", CLOSE_FAILED)]
+    assert summary["status"] == COMPLETED_WITH_ERRORS and client.positions == {}
+    assert rig.sent == [("BBBUSDT", CLOSE_LONG), ("BBBUSDT", CLOSE_LONG)]
+
+
+def test_a_retry_buys_nothing_the_first_attempt_did_not(tmp_path: Path) -> None:
+    rig = Rig(_client({"AAAUSDT": BREAKS}), tmp_path)
+    rig.store.mark_cycle_incomplete(TODAY, None)  # an earlier attempt decided the entries and saw no breakout
+    summary = rig.run()
+    assert [(order["symbol"], order["status"]) for order in summary["opens"]] == [("AAAUSDT", ENTRIES_DECIDED)]
+    assert rig.sent == [] and rig.paper.positions == {}
+
+
+def test_a_held_contract_on_its_way_out_keeps_its_exit_checked(tmp_path: Path) -> None:
+    rig = Rig(_client({"AAAUSDT": FALLS, "BBBUSDT": QUIET}), tmp_path)
+    rig.paper.open("AAAUSDT", 5.0, 100.0, 80.0, NOW_MS - DAY_MS)
+    rig.executor.load_market_rules(["AAAUSDT", "BBBUSDT"])  # known from an earlier day
+    rig.client.symbols["AAAUSDT"] = symbol_info("AAAUSDT", status="SETTLING")
+    summary = rig.run()
+    assert summary["untradable"] == ["AAAUSDT"]
+    assert [(order["symbol"], order["status"]) for order in summary["closes"]] == [("AAAUSDT", SIMULATED)]
+    assert rig.paper.positions == {}
+
+
+def test_a_close_filled_in_part_is_finished_on_the_retry_and_reported_whole(tmp_path: Path) -> None:
+    client = _client({"BBBUSDT": FALLS})
+    _hold_on_exchange(client, "BBBUSDT", quantity=4.0)
+    sell = client.futures_create_order
+    halves = [True]
+
+    def half_once(**parameters: Any) -> dict[str, Any]:
+        if halves and parameters["side"] == "SELL":
+            halves.pop()
+            order = sell(**{**parameters, "quantity": "1"})
+            client.orders[parameters["newClientOrderId"]]["status"] = order["status"] = "EXPIRED"
+            return order
+        return sell(**parameters)
+
+    client.futures_create_order = half_once  # type: ignore[method-assign]
+    rig = Rig(client, tmp_path, mode=TESTNET)
+    assert rig.run()["status"] == INCOMPLETE and client.positions["BBBUSDT"][0] == 3.0
+    summary = rig.run()
+
+    ((close),) = summary["closes"]
+    assert (close["status"], close["quantity"]) == (FILLED, 4.0) and summary["status"] == COMPLETED
+    first, rest = client.sent("futures_create_order")
+    assert first["newClientOrderId"] == "tb-20261009-BBBUSDT-c" and rest["newClientOrderId"] == "tb-202610092-BBBUSDT-c"
+    assert client.positions == {}
+
+
+def test_an_entry_that_went_wrong_is_not_reported_as_done_when_repeated(tmp_path: Path) -> None:
+    rig = Rig(_client({"AAAUSDT": BREAKS}), tmp_path)
+    rig.store.record_dispatch(TODAY, "AAAUSDT", OPEN_LONG,
+                              {"symbol": "AAAUSDT", "action": OPEN_LONG, "status": STOP_FAILED_CLOSED})
+    summary = rig.run()
+    assert [(order["symbol"], order["status"]) for order in summary["opens"]] == [("AAAUSDT", STOP_FAILED_CLOSED)]
+    assert summary["status"] == COMPLETED_WITH_ERRORS and rig.sent == []
+
+
+def test_past_the_entry_deadline_a_failed_close_ends_the_day_with_errors(tmp_path: Path, log: list[str]) -> None:
+    client = _client({"AAAUSDT": BREAKS, "BBBUSDT": FALLS})
+    _hold_on_exchange(client, "BBBUSDT")
+    client.fail["futures_create_order"] = [api_error(-4131, "PERCENT_PRICE filter limit")]
+    rig = Rig(client, tmp_path, mode=TESTNET, max_entry_delay_minutes=0.0)
+    summary = rig.run()
+
     assert summary["status"] == COMPLETED_WITH_ERRORS
     assert summary["closes"][0]["status"] == ERROR and "PERCENT_PRICE" in summary["closes"][0]["reason"]
     assert [(r["symbol"], r["status"]) for r in summary["opens"]] == [("AAAUSDT", CLOSE_FAILED)]
-    assert rig.sent == [("BBBUSDT", CLOSE_LONG)]
     assert list(client.positions) == ["BBBUSDT"] and len(client.algo_orders) == 1  # still has its stop
     assert rig.store.is_cycle_already_executed(TODAY)
-    assert any(line.startswith("ERROR|BBBUSDT: CLOSE_LONG was not executed") for line in log)
     assert any(line.startswith(f"WARNING|Cycle {TODAY} finished (COMPLETED_WITH_ERRORS)") for line in log)
 
 
@@ -433,17 +541,39 @@ def test_an_order_below_the_minimum_notional_is_reported_not_sent(tmp_path: Path
     assert summary["status"] == COMPLETED_WITH_ERRORS and client.sent("futures_create_order") == []
 
 
-def test_a_position_without_stop_is_counted_with_the_protective_distance(tmp_path: Path, log: list[str]) -> None:
+def test_a_position_found_without_stop_gets_one_back(tmp_path: Path, log: list[str]) -> None:
     client = _client({"AAAUSDT": QUIET, "BBBUSDT": QUIET})
-    client.positions["AAAUSDT"] = [5.0, 100.0]
+    client.positions["AAAUSDT"] = [5.0, 100.0]  # e.g. the process died between the fill and its stop
     rig = Rig(client, tmp_path, mode=TESTNET)
     seen: list[Any] = []
     reconcile = rig.executor.get_open_positions
     rig.executor.get_open_positions = lambda fallback=None: seen.extend(reconcile(fallback)) or seen  # type: ignore[method-assign]
-    assert rig.run()["status"] == COMPLETED
-    # 2 ATR of a range whose ATR is around 2.9, times 5 units.
-    assert seen[0].risk_usd == pytest.approx(5.0 * 2.0 * 2.9, rel=0.1)
-    assert any("AAAUSDT: position without a stop on the exchange" in line for line in log)
+    summary = rig.run()
+
+    assert summary["status"] == COMPLETED
+    ((restored),) = summary["protected"]
+    assert (restored["symbol"], restored["status"]) == ("AAAUSDT", STOP_RESTORED)
+    (stop,) = client.algo_orders
+    # Entry minus 2 ATR of a range whose ATR is about 2.9.
+    assert stop["side"] == "SELL" and float(stop["quantity"]) == 5.0
+    assert float(stop["triggerPrice"]) == pytest.approx(94.2, abs=0.6)
+    assert stop["clientAlgoId"] == f"tb-{TODAY.replace('-', '')}-AAAUSDT-r"
+    assert seen[0].risk_usd == pytest.approx(5.0 * (100.0 - float(stop["triggerPrice"])))
+    assert rig.store.dispatched(TODAY)["AAAUSDT:PROTECT"]["status"] == STOP_RESTORED
+    assert any("AAAUSDT: 5 units without a stop on the exchange" in line for line in log)
+
+    rig.store = DailyStateStore(tmp_path / "other.json")  # a second pass finds the stop and leaves it alone
+    assert rig.executor.protect_open_positions({"AAAUSDT": 5.8}, TODAY) == []
+
+
+def test_a_position_below_its_restored_stop_level_is_closed(tmp_path: Path) -> None:
+    client = _client({"AAAUSDT": QUIET})
+    client.positions["AAAUSDT"] = [5.0, 120.0]  # entry 120, price 100: 2 ATR below the entry is above the price
+    rig = Rig(client, tmp_path, mode=TESTNET)
+    summary = rig.run()
+    ((closed),) = summary["protected"]
+    assert (closed["symbol"], closed["status"]) == ("AAAUSDT", CLOSED_UNPROTECTED)
+    assert client.positions == {} and client.algo_orders == []
 
 
 # --- Paper account between cycles --------------------------------------------

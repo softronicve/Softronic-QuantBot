@@ -13,13 +13,15 @@ dashboard: it shows the last known and, if there is nothing, the last cycle's.
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,6 +42,70 @@ RECENT_CANDLES = 3
 # What the dashboard chart may ask for: only USDT contracts and these intervals.
 INTERVALS = ("5m", "15m", "1h", "4h", "1d")
 SYMBOL = re.compile(r"[A-Z0-9]{1,20}USDT")
+# Binance answers 429 when a client goes over its request weight, and 418 (an IP ban) when it keeps going.
+RATE_LIMITED = frozenset({418, 429})
+# Upstream failures the feeds absorb; anything else is a bug and propagates.
+UPSTREAM_ERRORS = (OSError, ValueError, LookupError, TypeError)
+
+
+class UnsupportedRequest(ValueError):
+    """The panel asked for a symbol or interval it does not serve. Nothing was sent upstream."""
+
+
+class RateLimitGate:
+    """Holds back every panel request to Binance after a 429 or 418 until ``Retry-After`` has passed.
+
+    The panel runs in the same container, and so from the same IP, as the daily
+    cycle: if it kept polling through a rate limit, the ban would also hit the bot.
+    """
+
+    def __init__(self, default_wait_seconds: float = 60.0, clock: Callable[[], float] = time.monotonic) -> None:
+        self._default_wait = default_wait_seconds
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._until = 0.0
+
+    def check(self) -> None:
+        """Raises ``OSError`` while the pause lasts, without touching the network."""
+        with self._lock:
+            remaining = self._until - self._clock()
+        if remaining > 0.0:
+            raise OSError(f"Binance rate limit: requests paused for another {remaining:.0f} s")
+
+    def trip(self, error: urllib.error.HTTPError) -> None:
+        try:
+            wait = float(error.headers.get("Retry-After", ""))
+        except (AttributeError, TypeError, ValueError):
+            wait = self._default_wait
+        wait = max(wait, 1.0)
+        with self._lock:
+            self._until = max(self._until, self._clock() + wait)
+        logger.warning("Basket dashboard: Binance answered {}; no more requests for {:.0f} s", error.code, wait)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._until = 0.0
+
+
+RATE_LIMIT = RateLimitGate()
+
+
+def get_json(url: str, timeout: float) -> Any:
+    """One GET to the public API, decoded.
+
+    A broken HTTP answer (``http.client.HTTPException``, e.g. ``IncompleteRead``)
+    is raised as ``OSError`` so that callers only have to handle ``UPSTREAM_ERRORS``.
+    """
+    RATE_LIMIT.check()
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        if error.code in RATE_LIMITED:
+            RATE_LIMIT.trip(error)
+        raise
+    except http.client.HTTPException as error:
+        raise OSError(f"broken HTTP answer ({type(error).__name__})") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,22 +120,19 @@ class Quote:
 def fetch_quote(base_url: str, symbol: str, timeout: float) -> Quote:
     """Reads the latest daily candles of ``symbol`` from the public API."""
     query = urllib.parse.urlencode({"symbol": symbol, "interval": "1d", "limit": RECENT_CANDLES})
-    with urllib.request.urlopen(f"{base_url}/fapi/v1/klines?{query}", timeout=timeout) as response:
-        rows = json.loads(response.read())
+    rows = get_json(f"{base_url}/fapi/v1/klines?{query}", timeout)
     return Quote(float(rows[-1][4]), tuple((int(row[0]), int(row[6]), float(row[3])) for row in rows))
 
 
 def fetch_prices(base_url: str, timeout: float) -> dict[str, float]:
     """Last price of every contract, in a single request to the public API."""
-    with urllib.request.urlopen(f"{base_url}/fapi/v1/ticker/price", timeout=timeout) as response:
-        rows = json.loads(response.read())
+    rows = get_json(f"{base_url}/fapi/v1/ticker/price", timeout)
     return {str(row["symbol"]): float(row["price"]) for row in rows}
 
 
 def fetch_stats(base_url: str, timeout: float) -> dict[str, dict[str, float]]:
     """Change and USDT volume over the last 24 hours for every contract, in one request."""
-    with urllib.request.urlopen(f"{base_url}/fapi/v1/ticker/24hr", timeout=timeout) as response:
-        rows = json.loads(response.read())
+    rows = get_json(f"{base_url}/fapi/v1/ticker/24hr", timeout)
     return {
         str(row["symbol"]): {"change_24h_pct": float(row["priceChangePercent"]), "volume_24h_usd": float(row["quoteVolume"])}
         for row in rows
@@ -78,16 +141,14 @@ def fetch_stats(base_url: str, timeout: float) -> dict[str, dict[str, float]]:
 
 def fetch_funding(base_url: str, timeout: float) -> dict[str, float]:
     """Last funding rate of every contract, in % per period (8 hours for almost all of them)."""
-    with urllib.request.urlopen(f"{base_url}/fapi/v1/premiumIndex", timeout=timeout) as response:
-        rows = json.loads(response.read())
+    rows = get_json(f"{base_url}/fapi/v1/premiumIndex", timeout)
     return {str(row["symbol"]): float(row["lastFundingRate"]) * 100.0 for row in rows if row.get("lastFundingRate")}
 
 
 def fetch_candles(base_url: str, symbol: str, interval: str, limit: int, timeout: float) -> dict[str, list[float]]:
     """The latest candles of ``symbol`` at ``interval``, the one in progress included. Times are in seconds."""
     query = urllib.parse.urlencode({"symbol": symbol, "interval": interval, "limit": limit})
-    with urllib.request.urlopen(f"{base_url}/fapi/v1/klines?{query}", timeout=timeout) as response:
-        rows = json.loads(response.read())
+    rows = get_json(f"{base_url}/fapi/v1/klines?{query}", timeout)
     return {
         "time": [int(row[0]) // 1000 for row in rows],
         "open": [float(row[1]) for row in rows],
@@ -141,7 +202,7 @@ class LiveFeed:
                 self._checked_at = now
                 try:
                     self._values = self._fetch()
-                except (OSError, ValueError, LookupError, TypeError) as error:
+                except UPSTREAM_ERRORS as error:
                     if not self._failing:
                         logger.warning("Basket dashboard: could not read {} ({}); showing the last known "
                                        "values", self._what, error)
@@ -190,8 +251,7 @@ def fetch_derivatives(base_url: str, symbol: str, timeout: float) -> dict[str, A
     """
     def read(path: str, limit: int) -> list[dict[str, Any]]:
         query = urllib.parse.urlencode({"symbol": symbol, "period": "1h", "limit": limit})
-        with urllib.request.urlopen(f"{base_url}/futures/data/{path}?{query}", timeout=timeout) as response:
-            return list(json.loads(response.read()))
+        return list(get_json(f"{base_url}/futures/data/{path}?{query}", timeout))
 
     interest = read("openInterestHist", 25)
     accounts = read("globalLongShortAccountRatio", 1)
@@ -213,8 +273,7 @@ def fetch_book(base_url: str, symbol: str, timeout: float, levels: int = 20, tra
     """The order book and the latest trades of a contract, for when the browser cannot listen to them live."""
     def read(path: str, limit: int) -> Any:
         query = urllib.parse.urlencode({"symbol": symbol, "limit": limit})
-        with urllib.request.urlopen(f"{base_url}/fapi/v1/{path}?{query}", timeout=timeout) as response:
-            return json.loads(response.read())
+        return get_json(f"{base_url}/fapi/v1/{path}?{query}", timeout)
 
     depth = read("depth", levels)
     return {
@@ -225,6 +284,59 @@ def fetch_book(base_url: str, symbol: str, timeout: float, levels: int = 20, tra
     }
 
 
+class ExpiringCache:
+    """Values per key that last ``ttl_seconds``; a failed read is remembered for ``failure_ttl_seconds``.
+
+    The upstream read runs outside the shared lock, so a slow contract does not
+    hold up the others, and concurrent requests for the same key share one read.
+    Remembering failures keeps a panel left open from hammering an API that is
+    already refusing it.
+    """
+
+    def __init__(
+        self, *, ttl_seconds: float, failure_ttl_seconds: float, max_entries: int, clock: Callable[[], float],
+    ) -> None:
+        self._ttl, self._failure_ttl, self._max_entries = ttl_seconds, failure_ttl_seconds, max_entries
+        self._clock = clock
+        self._lock = threading.Lock()
+        # key -> (read at, value, error); exactly one of value and error is set.
+        self._entries: dict[Hashable, tuple[float, Any, Exception | None]] = {}
+        self._reading: dict[Hashable, threading.Lock] = {}
+
+    def get(self, key: Hashable, fetch: Callable[[], Any]) -> Any:
+        with self._lock:
+            reading = self._reading.setdefault(key, threading.Lock())
+        with reading:
+            with self._lock:
+                entry = self._fresh(key)
+            if entry is None:
+                read_at = self._clock()
+                try:
+                    entry = (read_at, fetch(), None)
+                except UPSTREAM_ERRORS as error:
+                    entry = (read_at, None, error)
+                with self._lock:
+                    self._store(key, entry)
+        if entry[2] is not None:
+            raise entry[2].with_traceback(None)
+        return entry[1]
+
+    def _fresh(self, key: Hashable) -> tuple[float, Any, Exception | None] | None:
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        lasts = self._ttl if entry[2] is None else self._failure_ttl
+        return entry if self._clock() - entry[0] < lasts else None
+
+    def _store(self, key: Hashable, entry: tuple[float, Any, Exception | None]) -> None:
+        self._entries.pop(key, None)
+        self._entries[key] = entry
+        while len(self._entries) > self._max_entries:
+            oldest = next(iter(self._entries))
+            del self._entries[oldest]
+            self._reading.pop(oldest, None)
+
+
 class LiveBySymbol:
     """A per-contract figure requested separately; each contract is reread at most every ``ttl_seconds``."""
 
@@ -233,35 +345,24 @@ class LiveBySymbol:
         fetch: Callable[[str], dict[str, Any]],
         *,
         ttl_seconds: float,
+        failure_ttl_seconds: float = 5.0,
         max_entries: int = 64,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._fetch = fetch
-        self._ttl, self._max_entries = ttl_seconds, max_entries
-        self._clock = clock
-        self._lock = threading.Lock()
-        self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._cache = ExpiringCache(ttl_seconds=ttl_seconds, failure_ttl_seconds=failure_ttl_seconds,
+                                    max_entries=max_entries, clock=clock)
 
     def get(self, symbol: str) -> dict[str, Any]:
         """The figure of the contract.
 
         Raises:
-            ValueError: if it is not a USDT contract.
-            OSError, LookupError, TypeError: if the API does not answer or answers something else.
+            UnsupportedRequest: if it is not a USDT contract.
+            OSError, ValueError, LookupError, TypeError: if the API does not answer or answers something else.
         """
         if not SYMBOL.fullmatch(symbol):
-            raise ValueError("unsupported symbol")
-        with self._lock:
-            now = self._clock()
-            known = self._cache.get(symbol)
-            if known is not None and now - known[0] < self._ttl:
-                return known[1]
-            value = self._fetch(symbol)
-            self._cache.pop(symbol, None)
-            self._cache[symbol] = (now, value)
-            while len(self._cache) > self._max_entries:
-                self._cache.pop(next(iter(self._cache)))
-            return value
+            raise UnsupportedRequest("unsupported symbol")
+        return self._cache.get(symbol, lambda: self._fetch(symbol))
 
 
 def derivatives(base_url: str, *, ttl_seconds: float = 60.0, timeout: float = 4.0) -> LiveBySymbol:
@@ -282,6 +383,7 @@ class LiveCandles:
         base_url: str,
         *,
         ttl_seconds: float = 10.0,
+        failure_ttl_seconds: float = 5.0,
         timeout: float = 4.0,
         limit: int = 300,
         max_entries: int = 64,
@@ -289,32 +391,19 @@ class LiveCandles:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._fetch = fetch or (lambda symbol, interval: fetch_candles(base_url, symbol, interval, limit, timeout))
-        self._ttl, self._max_entries = ttl_seconds, max_entries
-        self._clock = clock
-        self._lock = threading.Lock()
-        self._cache: dict[tuple[str, str], tuple[float, dict[str, list[float]]]] = {}
+        self._cache = ExpiringCache(ttl_seconds=ttl_seconds, failure_ttl_seconds=failure_ttl_seconds,
+                                    max_entries=max_entries, clock=clock)
 
     def get(self, symbol: str, interval: str) -> dict[str, list[float]]:
         """The candles asked for.
 
         Raises:
-            ValueError: if the symbol or the interval is not one of those served.
-            OSError, LookupError, TypeError: if the API does not answer or answers something else.
+            UnsupportedRequest: if the symbol or the interval is not one of those served.
+            OSError, ValueError, LookupError, TypeError: if the API does not answer or answers something else.
         """
         if interval not in INTERVALS or not SYMBOL.fullmatch(symbol):
-            raise ValueError("unsupported symbol or interval")
-        key = (symbol, interval)
-        with self._lock:
-            now = self._clock()
-            known = self._cache.get(key)
-            if known is not None and now - known[0] < self._ttl:
-                return known[1]
-            candles = self._fetch(symbol, interval)
-            self._cache.pop(key, None)
-            self._cache[key] = (now, candles)
-            while len(self._cache) > self._max_entries:
-                self._cache.pop(next(iter(self._cache)))
-            return candles
+            raise UnsupportedRequest("unsupported symbol or interval")
+        return self._cache.get((symbol, interval), lambda: self._fetch(symbol, interval))
 
 
 class LiveQuotes:
@@ -370,7 +459,7 @@ class LiveQuotes:
         for symbol in symbols:
             try:
                 self._quotes[symbol] = self._fetch(symbol)
-            except (OSError, ValueError, LookupError, TypeError) as error:
+            except UPSTREAM_ERRORS as error:
                 # Requests stop at the first failure: if the API does not answer, each symbol would cost another wait.
                 if not self._failing:
                     logger.warning("Basket dashboard: could not read the current price of {} ({}); showing the "
