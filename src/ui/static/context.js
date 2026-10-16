@@ -53,14 +53,14 @@ function renderContextStrip() {
 
 function newsItems() {
   const items = (context && context.news && context.news.items) || [];
-  const coin = selected ? selected.replace(/USDT$/, "") : null;
+  const coin = selected ? coinOf(selected) : null;
   if (newsFilter === "basket") return items.filter((item) => item.coins.length);
   if (newsFilter === "coin") return items.filter((item) => item.coins.includes(coin));
   return items;
 }
 
 function renderNews() {
-  const coin = selected ? selected.replace(/USDT$/, "") : "Coin";
+  const coin = selected ? coinOf(selected) : "Coin";
   $("news-coin").textContent = coin;
   const all = (context && context.news && context.news.items) || [];
   const items = newsItems();

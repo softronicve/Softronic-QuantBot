@@ -267,3 +267,21 @@ def test_the_command_line_explains_what_is_missing(
     monkeypatch.setattr(notifier, "get_settings", lambda: both)
     assert notifier.main(["--test"]) == 0 and "Message sent" in capsys.readouterr().out
     assert telegram.calls[-1][1]["chat_id"] == "555"
+
+
+def test_repairs_and_missing_candles_ask_for_attention() -> None:
+    summary = _summary(
+        protected=[{"symbol": "OPUSDT", "status": "STOP_RESTORED", "stop_price": 0.12},
+                   {"symbol": "SUSDT", "status": "UNPROTECTED", "reason": "no candles"}],
+        closes=[{"symbol": "APTUSDT", "status": "PARTIAL_CLOSE", "reason": "3 left unsold"}],
+        without_data=["NEARUSDT"],
+    )
+    text, eventful = cycle_message(summary, [], None, None)
+    assert eventful
+    assert text.splitlines()[1:] == [
+        "ATTENTION",
+        "• OP: had no stop on the exchange; it has been placed again",
+        "• S: HAS NO STOP on the exchange and it could not be fixed: check it now",
+        "• APT: the sell filled only in part; the rest stays open with its stop",
+        "• NEAR: no candles today; its exit could not be checked",
+    ]

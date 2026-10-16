@@ -43,6 +43,7 @@ from loguru import logger
 from requests.exceptions import RequestException
 
 from src.engine.orchestrator import CLOSE_LONG, OPEN_LONG, OrderIntent
+from src.atomic_file import write_atomically
 from src.execution.errors import BrokerError, BrokerUnavailableError, OrderRejectedError
 from src.risk.portfolio_risk import ActivePosition
 from src.strategies.trend_breakout import InstrumentSpec
@@ -55,6 +56,8 @@ MODES = (DRY_RUN, TESTNET, LIVE)
 QUOTE_ASSET = "USDT"
 ASSET_CLASS = "crypto"
 STOP_MARKET = "STOP_MARKET"
+# Conditional orders that protect a long, whoever placed them: a stop set by hand counts as one.
+PROTECTIVE_ORDER_TYPES = frozenset({STOP_MARKET, "STOP", "TRAILING_STOP_MARKET"})
 DAILY = "1d"
 
 # Outcome of ``execute_order_intent``.
@@ -65,6 +68,13 @@ SKIPPED = "SKIPPED"
 NO_POSITION = "NO_POSITION"
 STOP_FAILED_CLOSED = "STOP_FAILED_CLOSED"
 UNPROTECTED = "UNPROTECTED"
+# Only part of a close was filled: the rest stays open, still under its stop.
+PARTIAL_CLOSE = "PARTIAL_CLOSE"
+# A position found without a stop: one was placed (STOP_RESTORED) or, failing that, it was closed.
+STOP_RESTORED = "STOP_RESTORED"
+CLOSED_UNPROTECTED = "CLOSED_UNPROTECTED"
+# ``action`` of those results: not an intent of the orchestrator, a repair done by the executor.
+PROTECT = "PROTECT"
 DONE = frozenset({FILLED, SIMULATED})
 
 # Reasons an order is not sent.
@@ -313,10 +323,7 @@ class PaperFuturesAccount:
         return stopped
 
     def _save(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self._path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(self._state, indent=2), encoding="utf-8")
-        temporary.replace(self._path)
+        write_atomically(self._path, json.dumps(self._state, indent=2))
 
 
 class BinanceFuturesExecutor:
@@ -378,6 +385,8 @@ class BinanceFuturesExecutor:
         self._clock = clock
         self._rules: dict[str, MarketRules] = {}
         self._leveraged: set[str] = set()
+        # Symbols whose last exchangeInfo said they can no longer be traded (e.g. SETTLING before a delisting).
+        self._retired: set[str] = set()
         self._account_checked = False
         if client is not None:
             self._client = client
@@ -401,10 +410,6 @@ class BinanceFuturesExecutor:
     @property
     def is_simulated(self) -> bool:
         return self._mode == DRY_RUN
-
-    @property
-    def paper(self) -> PaperFuturesAccount | None:
-        return self._paper
 
     def describe_mode(self) -> str:
         return {
@@ -471,28 +476,47 @@ class BinanceFuturesExecutor:
         """Funding payments of the contract between two instants, both included."""
         return self._read("futures_funding_rate", symbol=symbol, startTime=start_ms, endTime=end_ms, limit=1000)
 
-    def load_market_rules(self, symbols: Iterable[str]) -> dict[str, MarketRules]:
+    def load_market_rules(self, symbols: Iterable[str], refresh: bool = False) -> dict[str, MarketRules]:
         """Trading rules of each symbol; they are downloaded once and kept.
 
         A symbol that does not exist, is not trading or is not a USDT perpetual
         is skipped with a warning: without rules nothing can be sized or sent.
+
+        Args:
+            refresh: download them again even if known. The daily cycle asks for
+                this: the process runs for months, and Binance changes steps and
+                minimums, and moves contracts to ``SETTLING`` before delisting them.
         """
         wanted = list(symbols)
-        if any(symbol not in self._rules for symbol in wanted):
+        if refresh or any(symbol not in self._rules for symbol in wanted):
             listed = {entry["symbol"]: entry for entry in self._read("futures_exchange_info")["symbols"]}
             for symbol in wanted:
-                if symbol in self._rules:
+                if symbol in self._rules and not refresh:
                     continue
                 entry = listed.get(symbol)
                 problem = _untradable(entry)
                 if problem:
+                    self._retired.add(symbol)
                     logger.warning("{}: no trading rules, {}", symbol, problem)
                     continue
                 try:
                     self._rules[symbol] = _parse_rules(entry)
                 except (KeyError, ValueError, ArithmeticError) as error:
+                    self._retired.add(symbol)
                     logger.warning("{}: unreadable trading rules ({}); skipped", symbol, error)
-        return {symbol: self._rules[symbol] for symbol in wanted if symbol in self._rules}
+                    continue
+                self._retired.discard(symbol)
+        # The last known rules of a retired symbol are kept (see ``known_rules``) but no longer offered.
+        return {symbol: self._rules[symbol] for symbol in wanted
+                if symbol in self._rules and symbol not in self._retired}
+
+    def known_rules(self, symbol: str) -> MarketRules | None:
+        """The last rules seen for ``symbol``, even if it can no longer be traded.
+
+        A held position in a contract on its way to delisting still needs them:
+        its exit has to keep being checked, and its stop restored if missing.
+        """
+        return self._rules.get(symbol)
 
     # --- Reconciliation ---------------------------------------------------
 
@@ -597,6 +621,84 @@ class BinanceFuturesExecutor:
             ))
         return active
 
+    def protect_open_positions(self, stop_distances: Mapping[str, float], cycle_id: str) -> list[dict[str, Any]]:
+        """Puts a stop back on every long position that has none on the exchange.
+
+        A crash between a fill and its stop order, or a stop cancelled by hand,
+        would otherwise leave the position bare for good: later cycles see the
+        symbol as held and never open it again. The stop goes at entry minus the
+        protective distance (2 ATR), as for an entry. If the price is already
+        below that level, or the exchange refuses the stop, the position is
+        closed, as a fresh entry whose stop fails is. Without a known distance
+        nothing is sent and the position is reported as unprotected.
+
+        Returns:
+            One result per position that needed attention (``action`` is
+            ``PROTECT``). Always empty in ``DRY_RUN``, where every simulated
+            position carries its stop.
+        """
+        if self._paper is not None:
+            return []
+        self._check_account_mode()
+        rows = [row for row in self._read("futures_position_information") if float(row["positionAmt"]) > 0.0]
+        if not rows:
+            return []
+        stops = self._open_stops(types=PROTECTIVE_ORDER_TYPES)
+        results = []
+        for row in rows:
+            symbol = row["symbol"]
+            if any(stop["side"] == "SELL" for stop in stops.get(symbol, [])):
+                continue
+            try:
+                results.append(self._restore_stop(symbol, float(row["positionAmt"]), float(row["entryPrice"]),
+                                                  stop_distances.get(symbol), cycle_id))
+            except BrokerError as error:
+                # One position the exchange cannot answer about must not hide what was done for the others.
+                logger.critical("{}: POSITION WITHOUT STOP; it could not be fixed ({})", symbol, error)
+                results.append({"symbol": symbol, "action": PROTECT, "status": UNPROTECTED, "mode": self._mode,
+                                "payloads": [], "quantity": float(row["positionAmt"]), "reason": str(error)})
+        return results
+
+    def _restore_stop(
+        self, symbol: str, quantity: float, entry: float, distance: float | None, cycle: str,
+    ) -> dict[str, Any]:
+        def result(status: str, **fields: Any) -> dict[str, Any]:
+            return {"symbol": symbol, "action": PROTECT, "status": status, "mode": self._mode, "payloads": [],
+                    "quantity": quantity, **fields}
+
+        logger.error("{}: {:g} units without a stop on the exchange", symbol, quantity)
+        rules = self.known_rules(symbol)
+        if rules is None or distance is None or not distance > 0.0:
+            logger.critical("{}: POSITION WITHOUT STOP and no data to work one out; check it by hand", symbol)
+            return result(UNPROTECTED, reason="no rules or no candles to work out the stop")
+        stop = rules.round_price(entry - distance)
+        price = Decimal(str(self.mark_price(symbol)))
+        payloads: list[dict[str, Any]] = []
+        if 0 < stop < price:
+            protect = self._stop_payload(symbol, rules.round_quantity(quantity), stop, cycle, kind="r")
+            payloads.append(protect)
+            try:
+                order = self._submit_stop(protect)
+            except Exception as error:  # noqa: BLE001 - any failure leads to the close below
+                cause = f"the stop could not be placed: {error}"
+            else:
+                logger.warning("{}: stop repuesto en {}", symbol, protect["triggerPrice"])
+                return result(STOP_RESTORED, stop_price=float(stop), stop_order_id=order.get("algoId"),
+                              payloads=payloads)
+        elif stop <= 0:
+            cause = f"the protective distance ({distance:g}) is larger than the entry price"
+        else:
+            cause = f"the price {price:f} is already below the stop {stop:f}"
+        logger.error("{}: {}; the position is closed", symbol, cause)
+        close = self._close_payload(symbol, quantity, _client_id(cycle, symbol, "u"))
+        payloads.append(close)
+        try:
+            filled, average = self._submit_market(close, lambda: quantity - max(self._position_amount(symbol), 0.0))
+        except BrokerError as error:
+            logger.critical("{}: POSITION WITHOUT STOP. It could not be closed either ({}); check it by hand", symbol, error)
+            return result(UNPROTECTED, reason=cause, payloads=payloads)
+        return result(CLOSED_UNPROTECTED, reason=cause, quantity=filled, price=average, payloads=payloads)
+
     # --- Orders -----------------------------------------------------------
 
     def execute_order_intent(self, intent: OrderIntent, cycle_id: str | None = None) -> dict[str, Any]:
@@ -628,7 +730,7 @@ class BinanceFuturesExecutor:
 
     def _open_long(self, intent: OrderIntent, cycle: str) -> dict[str, Any]:
         symbol = intent.symbol
-        rules = self._rules.get(symbol) or self.load_market_rules([symbol]).get(symbol)
+        rules = self.load_market_rules([symbol]).get(symbol)
         if rules is None:
             return self._refuse(intent, NO_RULES, "there are no trading rules for the symbol")
         quantity = rules.round_quantity(intent.volume)
@@ -673,7 +775,7 @@ class BinanceFuturesExecutor:
         protect = self._stop_payload(symbol, rules.round_quantity(filled), stop, cycle)
         try:
             stop_order = self._submit_stop(protect)
-        except BrokerError as error:
+        except Exception as error:  # noqa: BLE001 - whatever stops the stop, the position must not stay bare
             return self._unprotected(intent, symbol, filled, average, cycle, [buy, protect], error)
         logger.info("{}: stop placed at {} (order {})", symbol, protect["triggerPrice"], stop_order.get("algoId"))
         return self._result(intent, FILLED, quantity=filled, price=average, stop_price=float(stop),
@@ -681,7 +783,7 @@ class BinanceFuturesExecutor:
 
     def _unprotected(
         self, intent: OrderIntent, symbol: str, filled: float, average: float, cycle: str,
-        payloads: list[dict[str, Any]], cause: BrokerError,
+        payloads: list[dict[str, Any]], cause: Exception,
     ) -> dict[str, Any]:
         """The stop could not be placed: the buy is undone rather than left unprotected."""
         logger.error("{}: could not place the stop ({}); closing the position just opened", symbol, cause)
@@ -721,6 +823,13 @@ class BinanceFuturesExecutor:
         sell = self._close_payload(symbol, amount, _client_id(cycle, symbol, "c"))
         filled, average = self._submit_market(sell, lambda: amount - max(self._position_amount(symbol), 0.0))
         logger.info("{}: closed {:g} units at {:g}", symbol, filled, average)
+        left = max(self._position_amount(symbol), 0.0)
+        if left > 0.0:
+            # The stop is reduceOnly: left in place it covers exactly what is still open.
+            logger.warning("{}: the close filled {:g} of {:g}; {:g} stay open with their stop", symbol, filled,
+                           amount, left)
+            return self._result(intent, PARTIAL_CLOSE, reason=f"{left:g} left unsold", quantity=filled,
+                                price=average, payloads=[sell])
         # After selling, never before: if the sell fails, the position keeps its stop.
         cancelled = self._cancel_stops(symbol)
         return self._result(intent, FILLED, quantity=filled, price=average, cancelled_stops=cancelled,
@@ -733,11 +842,13 @@ class BinanceFuturesExecutor:
             "reduceOnly": "true", "newOrderRespType": "RESULT", "newClientOrderId": client_id,
         }
 
-    def _stop_payload(self, symbol: str, quantity: Decimal, stop: Decimal, cycle: str) -> dict[str, Any]:
+    def _stop_payload(
+        self, symbol: str, quantity: Decimal, stop: Decimal, cycle: str, kind: str = "s",
+    ) -> dict[str, Any]:
         return {
             "algoType": "CONDITIONAL", "symbol": symbol, "side": "SELL", "type": STOP_MARKET,
             "quantity": _text(quantity), "triggerPrice": _text(stop), "reduceOnly": "true",
-            "workingType": self._stop_working_type, "clientAlgoId": _client_id(cycle, symbol, "s"),
+            "workingType": self._stop_working_type, "clientAlgoId": _client_id(cycle, symbol, kind),
         }
 
     def _submit_market(self, payload: dict[str, Any], already_filled: Callable[[], float]) -> tuple[float, float]:
@@ -753,6 +864,12 @@ class BinanceFuturesExecutor:
             try:
                 order = self._once("futures_create_order", **payload)
             except BrokerError as error:
+                if _not_executed_and_retryable(error) and attempt < self._retries:
+                    logger.warning("{}: order {} not accepted for now ({}); sending it again in {:g} s", symbol, client_id,
+                                   error, wait)
+                    self._sleep(wait)
+                    wait *= 2.0
+                    continue
                 if not getattr(error, "uncertain", False):
                     raise OrderRejectedError(str(error)) from error
                 logger.warning("{}: order {} got no answer ({}); checking whether it arrived", symbol, client_id, error)
@@ -798,6 +915,12 @@ class BinanceFuturesExecutor:
             try:
                 return self._once("futures_create_algo_order", **payload)
             except BrokerError as error:
+                if _not_executed_and_retryable(error) and attempt < self._retries:
+                    logger.warning("{}: stop {} not accepted for now ({}); sending it again in {:g} s", symbol, client_id,
+                                   error, wait)
+                    self._sleep(wait)
+                    wait *= 2.0
+                    continue
                 if not getattr(error, "uncertain", False):
                     raise
                 logger.warning("{}: stop {} got no answer ({}); checking whether it arrived", symbol, client_id, error)
@@ -810,12 +933,14 @@ class BinanceFuturesExecutor:
                     raise
         raise AssertionError("unreachable")
 
-    def _open_stops(self, symbol: str | None = None) -> dict[str, list[dict[str, Any]]]:
+    def _open_stops(
+        self, symbol: str | None = None, types: frozenset[str] = frozenset({STOP_MARKET}),
+    ) -> dict[str, list[dict[str, Any]]]:
         """Live conditional stops, per symbol."""
         parameters = {"symbol": symbol} if symbol else {}
         stops: dict[str, list[dict[str, Any]]] = {}
         for order in self._read("futures_get_open_algo_orders", **parameters):
-            if (order.get("orderType") or order.get("type")) != STOP_MARKET:
+            if (order.get("orderType") or order.get("type")) not in types:
                 continue
             stops.setdefault(order["symbol"], []).append({
                 "id": order.get("algoId"), "client_id": order.get("clientAlgoId"), "side": order.get("side"),
@@ -901,6 +1026,11 @@ class BinanceFuturesExecutor:
     def _result(self, intent: OrderIntent, status: str, **fields: Any) -> dict[str, Any]:
         return {"symbol": intent.symbol, "action": intent.action, "status": status, "mode": self._mode,
                 "payloads": [], **fields}
+
+
+def _not_executed_and_retryable(error: BrokerError) -> bool:
+    """Binance refused the request without executing it (clock skew, rate limit, overload): resending is safe."""
+    return isinstance(error, FuturesApiError) and not error.uncertain and error.code in RETRYABLE_CODES
 
 
 def _floor(value: float | Decimal, step: Decimal) -> Decimal:

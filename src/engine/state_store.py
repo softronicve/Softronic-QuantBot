@@ -12,6 +12,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src.atomic_file import write_atomically
+
 STARTED = "STARTED"
 COMPLETED = "COMPLETED"
 
@@ -76,6 +78,17 @@ class DailyStateStore:
         cycle = self.get_cycle(cycle_date)
         return cycle["dispatched"] if cycle else {}
 
+    def mark_cycle_incomplete(self, cycle_date: str, entry_block: str | None) -> None:
+        """Notes that the cycle ran but left something pending, and how its entries were settled.
+
+        ``entry_block`` is why that attempt took no entries (e.g. a failed
+        close), or ``None`` if it decided them. Either way a later attempt of the
+        same day takes no new ones: entries are decided once a day.
+        """
+        self.mark_cycle_started(cycle_date)
+        self._cycles[cycle_date]["incomplete"] = {"entry_block": entry_block}
+        self._save()
+
     def mark_cycle_completed(self, cycle_date: str, summary: dict[str, Any]) -> None:
         """Mark the cycle as executed: from here on it is not repeated."""
         self.mark_cycle_started(cycle_date)
@@ -85,10 +98,7 @@ class DailyStateStore:
     def _save(self) -> None:
         for old in sorted(self._cycles)[: -self._keep]:
             del self._cycles[old]
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self._path.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"version": 1, "cycles": self._cycles}, indent=2), encoding="utf-8")
-        temporary.replace(self._path)
+        write_atomically(self._path, json.dumps({"version": 1, "cycles": self._cycles}, indent=2))
 
 
 def _valid(cycle_date: str) -> str:

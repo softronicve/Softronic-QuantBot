@@ -64,6 +64,8 @@ const usd = (value) => (isNumber(value) ? `${number(value, 2)} USDT` : "—");
 const signed = (value, decimals = 2) => (isNumber(value) ? `${value >= 0 ? "+" : "−"}${number(Math.abs(value), decimals)}` : "—");
 const units = (value) => (isNumber(value) ? value.toLocaleString("en-US", { maximumFractionDigits: 8 }) : "—");
 const tone = (value) => (!isNumber(value) || value === 0 ? "" : value > 0 ? "up" : "down");
+// The coin of a contract: BTCUSDT -> BTC. Shared by every script of the page.
+const coinOf = (symbol) => symbol.replace(/USDT$/, "");
 
 function heatClass(proximity) {
   if (!isNumber(proximity)) return "heat-none";
@@ -237,7 +239,7 @@ function renderPositions(data) {
   if (!positions.length) {
     $("positions-hint").textContent = "";
     replace(body, el("tr", { class: "empty" }, el("td", { colspan: "7", text: report
-      ? "No open positions: the bot is waiting for a coin to close above its 20-day high."
+      ? `No open positions: the bot is waiting for a coin to close above its ${report.parameters.entry_period}-day high.`
       : "No data yet." })));
     return;
   }
@@ -248,7 +250,7 @@ function renderPositions(data) {
   const rows = positions.map((p) => {
     const [label, kind] = POSITION_STATES[p.status] || [p.status, "none"];
     const line = el("tr", {},
-      cell("mono", el("b", { text: p.symbol.replace(/USDT$/, "") }),
+      cell("mono", el("b", { text: coinOf(p.symbol) }),
         isNumber(p.opened_at) ? `since ${OPENED.format(new Date(p.opened_at))} UTC` : null),
       cell("num", price(p.entry_price), `${units(p.quantity)} units · ${number(p.cost_usd)} USDT`),
       cell("num", price(p.price), p.valued_at_stop ? `exits at the stop: ${number(p.value_usd)} USDT`
@@ -266,12 +268,15 @@ function renderPositions(data) {
   const total = (field) => positions.reduce((sum, p) => sum + p[field], 0);
   const openPnl = total("pnl_usd");
   const costs = positions.every((p) => isNumber(p.costs_usd)) ? total("costs_usd") : null;
+  // A position without a stop has no bounded loss: adding it as zero would understate the risk.
+  const atStops = positions.every((p) => isNumber(p.result_at_stop_usd)) ? total("result_at_stop_usd") : null;
   rows.push(el("tr", { class: "total" },
     cell("", "Total"),
     cell("num", `${number(total("cost_usd"))} USDT`),
     cell("num", `${number(total("value_usd"))} USDT`),
     cell(`num ${tone(openPnl)}`, `${signed(openPnl)} USDT`, percent(openPnl / total("cost_usd") * 100)),
-    cell("num", `${signed(total("result_at_stop_usd"))} USDT`, "if every stop were hit"),
+    cell("num", isNumber(atStops) ? `${signed(atStops)} USDT` : "—",
+      isNumber(atStops) ? "if every stop were hit" : "some positions have no stop"),
     cell("num", ""),
     cell("wrap", "", isNumber(costs) ? `Fees and funding already paid: ${number(costs)} USDT (deducted from the balance).` : null),
   ));
@@ -375,7 +380,7 @@ function listEntries(report, now) {
     const current = live ? live.price : row.close;
     const since = (days) => (closes.length >= days && isNumber(current) ? (current / closes[closes.length - days] - 1) * 100 : null);
     return {
-      row, live, symbol: row.symbol, coin: row.symbol.replace(/USDT$/, ""), price: current,
+      row, live, symbol: row.symbol, coin: coinOf(row.symbol), price: current,
       day: live ? live.change_pct : null, h24: live ? live.change_24h_pct : null, d7: since(7), d30: since(30),
       volume: live ? live.volume_24h_usd : null, funding: live ? live.funding_pct : null,
       proximity: live ? live.proximity_pct : row.proximity_pct, cycle: row.proximity_pct,
@@ -445,11 +450,10 @@ function tick(symbol, value) {
 
 function renderPreview(data) {
   const rows = (data.radar && data.radar.rows) || {};
-  const coin = (symbol) => symbol.replace(/USDT$/, "");
-  const breaking = Object.keys(rows).filter((symbol) => rows[symbol].breaking).map(coin);
+  const breaking = Object.keys(rows).filter((symbol) => rows[symbol].breaking).map(coinOf);
   const positions = data.positions || [];
-  const stopped = positions.filter((p) => p.status === "STOP_TOUCHED").map((p) => coin(p.symbol));
-  const exiting = positions.filter((p) => p.status === "BELOW_EXIT_CHANNEL").map((p) => coin(p.symbol));
+  const stopped = positions.filter((p) => p.status === "STOP_TOUCHED").map((p) => coinOf(p.symbol));
+  const exiting = positions.filter((p) => p.status === "BELOW_EXIT_CHANNEL").map((p) => coinOf(p.symbol));
   const node = $("radar-preview");
   if (!data.report || !Object.keys(rows).length) {
     replace(node);
@@ -486,7 +490,7 @@ function renderRadar(report) {
       class: `tile ${heatClass(proximity)}${row.symbol === selected ? " selected" : ""}${live ? tick(row.symbol, live.price) : ""}`,
       title: (STATES[row.state] || [row.state])[0],
     },
-      el("span", { class: "tile-top" }, el("b", { text: row.symbol.replace(/USDT$/, "") }),
+      el("span", { class: "tile-top" }, el("b", { text: coinOf(row.symbol) }),
         live ? el("i", { class: tone(live.change_pct), text: `${signed(live.change_pct)} %` }) : null),
       el("span", { class: "tile-now", text: isNumber(proximity) ? `${signed(proximity)} %` : "no data" }),
       el("span", { class: "tile-last", text: isNumber(row.proximity_pct) ? `${live ? "close" : "at close"} ${signed(row.proximity_pct)} %` : "" }),
@@ -622,8 +626,9 @@ function renderChart(row, daily, position) {
     // Intraday the channels are two fixed levels: the ones the next cycle will use.
     series.entry.setData([]);
     series.exit.setData([]);
-    level(now ? now.entry_channel : row && row.high_entry, token("--accent"), "20 d high", LC.LineStyle.Solid, 2);
-    level(now ? now.exit_channel : row && row.low_exit, token("--info"), "10 d low", LC.LineStyle.Solid, 2);
+    const periods = snapshot && snapshot.report ? snapshot.report.parameters : null;
+    level(now ? now.entry_channel : row && row.high_entry, token("--accent"), periods ? `${periods.entry_period} d high` : "high", LC.LineStyle.Solid, 2);
+    level(now ? now.exit_channel : row && row.low_exit, token("--info"), periods ? `${periods.exit_period} d low` : "low", LC.LineStyle.Solid, 2);
   } else {
     const today = live && daily && live.time[live.time.length - 1] > daily.time[daily.time.length - 1]
       ? live.time[live.time.length - 1] : null;
@@ -756,7 +761,7 @@ function select(symbol) {
 
 // --- Audit ------------------------------------------------------------------
 
-const names = (orders) => (orders || []).map((order) => `${order.symbol.replace(/USDT$/, "")}${order.status && !["FILLED", "SIMULATED"].includes(order.status) ? ` (${order.status})` : ""}`).join(", ") || "—";
+const names = (orders) => (orders || []).map((order) => `${coinOf(order.symbol)}${order.status && !["FILLED", "SIMULATED"].includes(order.status) ? ` (${order.status})` : ""}`).join(", ") || "—";
 
 function renderAudit(data) {
   const available = new Set(data.meta.report_dates || []);
@@ -765,7 +770,7 @@ function renderAudit(data) {
     el("td", { class: "mono", text: cycle.cycle_date }),
     el("td", { class: "mono", text: cycle.status || "—" }),
     el("td", { class: "mono", text: names(cycle.opens) }),
-    el("td", { class: "mono", text: names(cycle.closes) + (cycle.stopped && cycle.stopped.length ? ` · stop: ${cycle.stopped.map((s) => s.replace(/USDT$/, "")).join(", ")}` : "") }),
+    el("td", { class: "mono", text: names(cycle.closes) + (cycle.stopped && cycle.stopped.length ? ` · stop: ${cycle.stopped.map(coinOf).join(", ")}` : "") }),
     el("td", { class: "mono", text: Object.entries(cycle.holds || {}).map(([reason, count]) => `${reason} ${count}`).join(" · ") || "—" }),
     el("td", {}, available.has(cycle.cycle_date)
       ? [el("a", { href: `/api/report.md?date=${cycle.cycle_date}`, download: true, text: "md" }), " · ",
@@ -800,33 +805,62 @@ function render(data) {
   runHooks("full");
 }
 
-async function refresh() {
+// A request that hangs is abandoned, and a refresh never starts while the previous one is still out:
+// with a stalled server, requests would otherwise pile up and come back in any order.
+const REQUEST_TIMEOUT_MS = 15000;
+const inFlight = new Set();
+
+async function fetchJson(path) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch("/api/snapshot", { cache: "no-store" });
+    const response = await fetch(path, { cache: "no-store", signal: controller.signal });
     if (!response.ok) throw new Error(`the server responded ${response.status}`);
-    render(await response.json());
+    return await response.json();
   } catch (error) {
-    replace($("notices"), el("p", { text: `Could not update the dashboard: ${error.message}` }));
+    throw error.name === "AbortError" ? new Error("the server did not answer in time") : error;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-// Between two full reads: only what moves with the price.
-async function refreshLive() {
-  if (!snapshot) return;
+async function once(name, task) {
+  if (inFlight.has(name)) return;
+  inFlight.add(name);
   try {
-    const response = await fetch("/api/live", { cache: "no-store" });
-    if (!response.ok) return;
-    Object.assign(snapshot, await response.json());
-  } catch (error) {
-    return;  // the dot at the top already shows that the prices are going stale
+    await task();
+  } finally {
+    inFlight.delete(name);
   }
-  renderNextCycle(snapshot.meta);
-  renderPortfolio(snapshot.report, snapshot.live);
-  renderPositions(snapshot);
-  renderCurve(snapshot.performance);
-  renderRadar(snapshot.report);
-  loadCandles();
-  runHooks("live");
+}
+
+function refresh() {
+  return once("full", async () => {
+    try {
+      render(await fetchJson("/api/snapshot"));
+    } catch (error) {
+      replace($("notices"), el("p", { text: `Could not update the dashboard: ${error.message}` }));
+    }
+  });
+}
+
+// Between two full reads: only what moves with the price.
+function refreshLive() {
+  if (!snapshot || document.hidden) return undefined;
+  return once("live", async () => {
+    try {
+      Object.assign(snapshot, await fetchJson("/api/live"));
+    } catch (error) {
+      return;  // the dot at the top already shows that the prices are going stale
+    }
+    renderNextCycle(snapshot.meta);
+    renderPortfolio(snapshot.report, snapshot.live);
+    renderPositions(snapshot);
+    renderCurve(snapshot.performance);
+    renderRadar(snapshot.report);
+    loadCandles();
+    runHooks("live");
+  });
 }
 
 $("symbol").addEventListener("change", (event) => select(event.target.value));
@@ -853,5 +887,7 @@ $("list-search").addEventListener("input", (event) => {
 renderClocks();
 setInterval(renderClocks, 1000);
 refresh();
-setInterval(refresh, REFRESH_MS);
+setInterval(() => { if (!document.hidden) refresh(); }, REFRESH_MS);
 setInterval(refreshLive, LIVE_MS);
+// A tab left in the background stops asking; coming back brings it up to date at once.
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });

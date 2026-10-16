@@ -46,6 +46,7 @@ from src.ui.context import MarketContext
 from src.ui.quotes import (
     PUBLIC_API,
     PUBLIC_STREAM,
+    UPSTREAM_ERRORS,
     LiveBySymbol,
     LiveCandles,
     LiveFeed,
@@ -56,6 +57,7 @@ from src.ui.quotes import (
     funding_rates,
     market_stats,
     order_book,
+    UnsupportedRequest,
 )
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -64,6 +66,14 @@ CONTENT_TYPES = {
     ".css": "text/css; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
 }
+JSON = "application/json; charset=utf-8"
+TEXT = "text/plain; charset=utf-8"
+# Names the panel answers to. A page on another site that rebinds its own domain to 127.0.0.1 (DNS
+# rebinding) still sends that domain as Host, so checking it keeps such a page from reading the account.
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+WILDCARD_ADDRESSES = frozenset({"", "0.0.0.0", "::"})
+# An idle or half-sent request does not keep a server thread forever.
+REQUEST_TIMEOUT_SECONDS = 30.0
 CONTENT_SECURITY_POLICY = (
     "default-src 'self'; script-src 'self'; connect-src 'self'{stream}; img-src 'self' data:; "
     "style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
@@ -527,8 +537,10 @@ class BasketDashboardServer(ThreadingHTTPServer):
         self.by_symbol = {"/api/derivatives": derivatives, "/api/book": book}
         self.context = context
         self.csp = CONTENT_SECURITY_POLICY.format(stream=f" {stream}" if stream else "")
+        bound = address[0]
+        self.allowed_hosts = LOOPBACK_HOSTS | ({bound} if bound not in WILDCARD_ADDRESSES else set())
         self._cache_seconds = cache_seconds
-        self._lock = threading.Lock()
+        self._rebuild = threading.Lock()
         self._cached: tuple[bytes, bytes] | None = None
         self._cached_at = 0.0
         # Only what is in this table is served: no path can get out of it.
@@ -543,92 +555,124 @@ class BasketDashboardServer(ThreadingHTTPServer):
 
         With ``live_only`` it carries only what changes between cycles (``LIVE_KEYS``):
         it is what the page asks for every few seconds, without the candles or the report.
+
+        Composing it asks Binance for prices, so it can take seconds. Only one
+        request rebuilds it; the others keep getting the previous one meanwhile
+        instead of queueing behind that request. Only the very first request waits.
         """
-        with self._lock:
-            if self._cached is None or time.monotonic() - self._cached_at >= self._cache_seconds:
-                full = self.panel.snapshot()
-                self._cached = (
-                    json.dumps(full, allow_nan=False).encode("utf-8"),
-                    json.dumps({key: full[key] for key in LIVE_KEYS if key in full}, allow_nan=False).encode("utf-8"),
-                )
-                self._cached_at = time.monotonic()
-            return self._cached[1 if live_only else 0]
+        cached = self._cached
+        if cached is None or time.monotonic() - self._cached_at >= self._cache_seconds:
+            if self._rebuild.acquire(blocking=cached is None):
+                try:
+                    if self._cached is cached:  # nobody rebuilt it while this request waited
+                        self._cached = self._compose()
+                        self._cached_at = time.monotonic()
+                except Exception:
+                    if self._cached is None:
+                        raise
+                    # Tried again after another cache period, not on every request.
+                    self._cached_at = time.monotonic()
+                    logger.exception("Could not rebuild the basket dashboard snapshot; serving the previous one")
+                finally:
+                    self._rebuild.release()
+        assert self._cached is not None
+        return self._cached[1 if live_only else 0]
+
+    def _compose(self) -> tuple[bytes, bytes]:
+        full = self.panel.snapshot()
+        return (
+            json.dumps(full, allow_nan=False).encode("utf-8"),
+            json.dumps({key: full[key] for key in LIVE_KEYS if key in full}, allow_nan=False).encode("utf-8"),
+        )
 
 
 class _Handler(BaseHTTPRequestHandler):
     server: BasketDashboardServer
+    timeout = REQUEST_TIMEOUT_SECONDS
 
     def do_GET(self) -> None:  # noqa: N802 (name imposed by http.server)
+        if not self._host_allowed():
+            self._send(HTTPStatus.FORBIDDEN, b"host not allowed", TEXT)
+            return
         url = urlsplit(self.path)
         path = url.path
+        query = parse_qs(url.query)
         if path in ("/api/snapshot", "/api/live"):
             try:
                 body = self.server.snapshot(live_only=path == "/api/live")
-                self._send(HTTPStatus.OK, body, "application/json; charset=utf-8")
-            except Exception as error:
+            except Exception:
                 logger.exception("Could not build the basket dashboard snapshot")
-                body = json.dumps({"error": str(error)}).encode("utf-8")
-                self._send(HTTPStatus.INTERNAL_SERVER_ERROR, body, "application/json; charset=utf-8")
+                # The detail goes to the log only: it can carry file names and paths.
+                self._send(HTTPStatus.INTERNAL_SERVER_ERROR, b'{"error": "could not build the dashboard"}', JSON)
+            else:
+                self._send(HTTPStatus.OK, body, JSON)
         elif path == "/api/candles":
-            self._candles(parse_qs(url.query))
+            symbol, interval = query.get("symbol", [""])[0], query.get("interval", [""])[0]
+            self._feed(
+                None if self.server.candles is None else lambda: self.server.candles.get(symbol, interval),
+                wrap=lambda candles: {"symbol": symbol, "interval": interval, **candles},
+                failure="could not read the candles", log=logger.warning,
+            )
         elif path in self.server.by_symbol:
-            self._by_symbol(self.server.by_symbol[path], parse_qs(url.query))
+            feed, symbol = self.server.by_symbol[path], query.get("symbol", [""])[0]
+            self._feed(None if feed is None else lambda: feed.get(symbol), failure="could not read", log=logger.debug)
         elif path == "/api/context":
             self._context()
         elif path in ("/api/report.md", "/api/report.json"):
             kind = path.rsplit(".", 1)[1]
-            requested = parse_qs(url.query).get("date", [None])[0]
             try:
-                body, filename = self.server.panel.report_file(kind, requested)
+                body, filename = self.server.panel.report_file(kind, query.get("date", [None])[0])
             except ReportNotFoundError as error:
-                self._send(HTTPStatus.NOT_FOUND, str(error).encode("utf-8"), "text/plain; charset=utf-8")
+                self._send(HTTPStatus.NOT_FOUND, str(error).encode("utf-8"), TEXT)
             else:
-                content_type = "text/markdown; charset=utf-8" if kind == "md" else "application/json; charset=utf-8"
+                content_type = "text/markdown; charset=utf-8" if kind == "md" else JSON
                 self._send(HTTPStatus.OK, body, content_type, download_as=filename)
         elif path == "/healthz":
-            self._send(HTTPStatus.OK, b"ok", "text/plain; charset=utf-8")
+            self._send(HTTPStatus.OK, b"ok", TEXT)
         else:
             name = "index.html" if path == "/" else path.removeprefix("/static/")
             asset = self.server.static.get(name) if path == "/" or path.startswith("/static/") else None
             if asset is None:
-                self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
+                self._send(HTTPStatus.NOT_FOUND, b"not found", TEXT)
             else:
                 self._send(HTTPStatus.OK, asset[0], asset[1])
 
-    def _candles(self, query: dict[str, list[str]]) -> None:
-        """Candles of a symbol at an interval, read from the public API. What is asked for is validated before going out."""
-        symbol, interval = query.get("symbol", [""])[0], query.get("interval", [""])[0]
-        text = "text/plain; charset=utf-8"
-        if self.server.candles is None:
-            self._send(HTTPStatus.NOT_FOUND, b"not found", text)
-            return
-        try:
-            candles = self.server.candles.get(symbol, interval)
-        except ValueError as error:
-            self._send(HTTPStatus.BAD_REQUEST, str(error).encode("utf-8"), text)
-        except (OSError, LookupError, TypeError) as error:
-            logger.warning("Basket dashboard: could not read the requested candles ({})", type(error).__name__)
-            self._send(HTTPStatus.BAD_GATEWAY, "could not read the candles".encode("utf-8"), text)
-        else:
-            body = json.dumps({"symbol": symbol, "interval": interval, **candles}, allow_nan=False).encode("utf-8")
-            self._send(HTTPStatus.OK, body, "application/json; charset=utf-8")
+    def _host_allowed(self) -> bool:
+        """Whether the ``Host`` header names this machine. Requests without one (HTTP/1.0) are let through."""
+        host = self.headers.get("Host")
+        if host is None:
+            return True
+        host = host.strip().lower().replace(".:", ":").rstrip(".")  # "localhost." is the same name
+        if host.startswith("["):  # [::1]:8770
+            name = host[1:host.find("]")]
+        elif host.count(":") == 1:  # localhost:8770
+            name = host.split(":")[0]
+        else:  # no port, or a bare IPv6 address
+            name = host
+        return name in self.server.allowed_hosts
 
-    def _by_symbol(self, feed: LiveBySymbol | None, query: dict[str, list[str]]) -> None:
-        """A public figure of a contract (derivatives or order book). The symbol is validated before going out."""
-        text = "text/plain; charset=utf-8"
-        if feed is None:
-            self._send(HTTPStatus.NOT_FOUND, b"not found", text)
+    def _feed(
+        self,
+        read: Callable[[], Any] | None,
+        *,
+        failure: str,
+        log: Callable[..., None],
+        wrap: Callable[[Any], Any] = lambda value: value,
+    ) -> None:
+        """Public Binance data read on request. What is asked is validated before anything goes out."""
+        if read is None:
+            self._send(HTTPStatus.NOT_FOUND, b"not found", TEXT)
             return
         try:
-            value = feed.get(query.get("symbol", [""])[0])
-        except ValueError as error:
-            self._send(HTTPStatus.BAD_REQUEST, str(error).encode("utf-8"), text)
-        except (OSError, LookupError, TypeError) as error:
-            logger.debug("Basket dashboard: contract figure not read ({})", type(error).__name__)
-            self._send(HTTPStatus.BAD_GATEWAY, "could not read".encode("utf-8"), text)
+            value = read()
+        except UnsupportedRequest as error:
+            self._send(HTTPStatus.BAD_REQUEST, str(error).encode("utf-8"), TEXT)
+        except UPSTREAM_ERRORS as error:
+            # Only the type: the message can carry the address that was asked.
+            log("Basket dashboard: {} ({})", failure, type(error).__name__)
+            self._send(HTTPStatus.BAD_GATEWAY, failure.encode("utf-8"), TEXT)
         else:
-            self._send(HTTPStatus.OK, json.dumps(value, allow_nan=False).encode("utf-8"),
-                       "application/json; charset=utf-8")
+            self._send(HTTPStatus.OK, json.dumps(wrap(value), allow_nan=False).encode("utf-8"), JSON)
 
     def _context(self) -> None:
         """What is outside Binance. With that part turned off the answer is empty, not an error."""
@@ -638,9 +682,16 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception:
             logger.exception("Could not build the market context of the dashboard")
             body = b"{}"
-        self._send(HTTPStatus.OK, body, "application/json; charset=utf-8")
+        self._send(HTTPStatus.OK, body, JSON)
 
     def _send(self, status: HTTPStatus, body: bytes, content_type: str, download_as: str | None = None) -> None:
+        try:
+            self._write(status, body, content_type, download_as)
+        except ConnectionError:
+            # The browser closed the tab or moved on before the answer arrived: nothing went wrong here.
+            logger.debug("Basket dashboard: the client left before {} was sent", self.path)
+
+    def _write(self, status: HTTPStatus, body: bytes, content_type: str, download_as: str | None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         if download_as is not None:
@@ -660,24 +711,26 @@ def build_server(
     settings: Settings, account: str, host: str | None = None, port: int | None = None
 ) -> BasketDashboardServer:
     """The dashboard server for an account (``dry_run``, ``testnet`` or ``live``), already bound to its port."""
+    api = PUBLIC_API[account]
+    external = settings.futures.panel_external_data
+    stream = PUBLIC_STREAM[account] if external else None
     panel = BasketPanel(
         state_path(settings, account), reports_dir(settings, account),
         settings.state_dir / "paper_futures.json" if account == "dry_run" else None,
         run_delay_seconds=settings.futures.run_delay_seconds,
-        quotes=LiveQuotes(PUBLIC_API[account]),
-        prices=LivePrices(PUBLIC_API[account]),
-        stats=market_stats(PUBLIC_API[account]),
-        funding=funding_rates(PUBLIC_API[account]),
-        stream=PUBLIC_STREAM[account] if settings.futures.panel_external_data else None,
+        quotes=LiveQuotes(api),
+        prices=LivePrices(api),
+        stats=market_stats(api),
+        funding=funding_rates(api),
+        stream=stream,
     )
-    external = settings.futures.panel_external_data
     return BasketDashboardServer(
         (host or settings.dashboard.host, port or settings.futures.dashboard_port), panel,
-        candles=LiveCandles(PUBLIC_API[account]),
-        derivatives=derivatives(PUBLIC_API[account]),
-        book=order_book(PUBLIC_API[account]),
+        candles=LiveCandles(api),
+        derivatives=derivatives(api),
+        book=order_book(api),
         context=MarketContext(panel.coins) if external else None,
-        stream=PUBLIC_STREAM[account] if external else None,
+        stream=stream,
     )
 
 

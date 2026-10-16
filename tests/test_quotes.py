@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import email.message
+import http.client
 import json
+import threading
+import time
+import urllib.error
 from typing import Any
 
 import pytest
@@ -244,19 +249,85 @@ def test_only_usdt_contracts_and_known_intervals_are_asked(symbol: str, interval
     assert asked == []
 
 
-def test_a_failed_candle_read_is_not_cached() -> None:
-    answers: list[Any] = [TimeoutError(), {"time": [1]}]
+def test_a_failed_candle_read_is_remembered_briefly_and_then_retried() -> None:
+    clock, answers = Clock(), [TimeoutError(), {"time": [1]}]
+    asked: list[float] = []
 
     def feed(symbol: str, interval: str) -> dict[str, list[float]]:
+        asked.append(clock.now)
         answer = answers.pop(0)
         if isinstance(answer, Exception):
             raise answer
         return answer
 
-    live = LiveCandles("https://example.invalid", fetch=feed)
-    with pytest.raises(TimeoutError):
-        live.get("BTCUSDT", "5m")
-    assert live.get("BTCUSDT", "5m") == {"time": [1]}
+    live = LiveCandles("https://example.invalid", failure_ttl_seconds=5.0, fetch=feed, clock=clock)
+    for _ in range(3):
+        with pytest.raises(TimeoutError):
+            live.get("BTCUSDT", "5m")
+    assert len(asked) == 1  # a panel left open does not keep hitting an API that is failing
+    clock.now += 5.0
+    assert live.get("BTCUSDT", "5m") == {"time": [1]} and len(asked) == 2
+
+
+def test_a_slow_contract_does_not_hold_up_the_others() -> None:
+    release = threading.Event()
+
+    def feed(symbol: str) -> dict[str, Any]:
+        if symbol == "SLOWUSDT":
+            release.wait(timeout=5)
+        return {"symbol": symbol}
+
+    live = LiveBySymbol(feed, ttl_seconds=60.0)
+    slow = threading.Thread(target=live.get, args=("SLOWUSDT",))
+    slow.start()
+    try:
+        started = time.monotonic()
+        assert live.get("FASTUSDT") == {"symbol": "FASTUSDT"}
+        assert time.monotonic() - started < 1.0
+    finally:
+        release.set()
+        slow.join(timeout=5)
+
+
+def _http_error(code: int, retry_after: str | None) -> urllib.error.HTTPError:
+    headers = email.message.Message()
+    if retry_after is not None:
+        headers["Retry-After"] = retry_after
+    return urllib.error.HTTPError("https://example.invalid", code, "limit", headers, None)
+
+
+@pytest.mark.parametrize(("code", "retry_after", "paused_for"), [(429, "30", 30.0), (418, None, 60.0)])
+def test_a_rate_limit_pauses_every_request_until_retry_after(
+    monkeypatch: pytest.MonkeyPatch, code: int, retry_after: str | None, paused_for: float,
+) -> None:
+    clock, calls = Clock(), []
+    monkeypatch.setattr(quotes, "RATE_LIMIT", quotes.RateLimitGate(clock=clock))
+
+    def urlopen(url: str, timeout: float) -> Any:
+        calls.append(url)
+        if len(calls) == 1:
+            raise _http_error(code, retry_after)
+        return _Response("[]")
+
+    monkeypatch.setattr(quotes.urllib.request, "urlopen", urlopen)
+    with pytest.raises(urllib.error.HTTPError):
+        fetch_prices("https://example.invalid", 3.0)
+    clock.now += paused_for - 1.0
+    with pytest.raises(OSError, match="rate limit"):
+        fetch_stats("https://example.invalid", 3.0)  # held back for every feed, not only the one that tripped
+    assert len(calls) == 1
+    clock.now += 1.0
+    assert fetch_prices("https://example.invalid", 3.0) == {} and len(calls) == 2
+
+
+def test_a_broken_http_answer_is_an_ordinary_failed_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    def urlopen(url: str, timeout: float) -> Any:
+        raise http.client.IncompleteRead(b"[", 100)
+
+    monkeypatch.setattr(quotes.urllib.request, "urlopen", urlopen)
+    with pytest.raises(OSError, match="IncompleteRead"):
+        fetch_prices("https://example.invalid", 3.0)
+    assert LivePrices("https://example.invalid").get() == ({}, None)
 
 
 def test_derivatives_and_book_are_read_from_the_public_api(monkeypatch: pytest.MonkeyPatch) -> None:

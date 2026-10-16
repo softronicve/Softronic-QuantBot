@@ -6,9 +6,12 @@ Once a day, shortly after 00:00 UTC:
 2. Downloads the contract rules and the closed daily candles.
 3. Reads the balance and the live positions from the exchange (in ``DRY_RUN``,
    from the paper account, after applying the day's stops and funding to it).
+   On the exchange, a position found without its stop gets one back.
 4. Asks the orchestrator for the day's orders.
 5. Dispatches the closes first and the buys after.
-6. Records the cycle, which is not repeated.
+6. Records the cycle, which is not repeated. If a close failed or a held
+   symbol had no candles, the day is left open and run again a few minutes
+   later (orders already sent are not repeated), until the entry deadline.
 
 The candles are requested before reading the account because the account needs
 them: they are used to check the stops of the paper account and to estimate the
@@ -52,9 +55,13 @@ from src.engine.state_store import DailyStateStore, StateError
 from src.execution.errors import BrokerError, BrokerUnavailableError
 from src.execution.binance_futures_executor import (
     DONE,
+    FILLED,
     DRY_RUN,
     LIVE,
     NO_POSITION,
+    PARTIAL_CLOSE,
+    PROTECT,
+    SIMULATED,
     STOP_FAILED_CLOSED,
     UNPROTECTED,
     BinanceFuturesExecutor,
@@ -74,11 +81,15 @@ ALREADY_EXECUTED = "ALREADY_EXECUTED"
 WRONG_DATE = "WRONG_DATE"
 NO_DATA = "NO_DATA"
 NO_BALANCE = "NO_BALANCE"
-# Cycles that never started and are worth retrying later.
-RETRY = frozenset({NO_DATA, NO_BALANCE})
+# A close did not go through, or a held symbol had no candles to check its exit: the day is not marked
+# done, so it is run again (orders already sent are not repeated) until max_entry_delay_minutes.
+INCOMPLETE = "INCOMPLETE"
+# Cycles that did not start (or finish) and are worth retrying later.
+RETRY = frozenset({NO_DATA, NO_BALANCE, INCOMPLETE})
 RETRY_PROBLEMS = {
     NO_DATA: "No symbol has valid daily candles.",
     NO_BALANCE: "The account has no balance.",
+    INCOMPLETE: "A sell was not executed or a held position has no candles to check its exit.",
 }
 
 # Result of an order that was never sent.
@@ -86,8 +97,14 @@ ERROR = "ERROR"
 ALREADY_DISPATCHED = "ALREADY_DISPATCHED"
 CLOSE_FAILED = "CLOSE_FAILED"
 TOO_LATE = "TOO_LATE"
+# An entry signal seen only when a pending day was run again: entries are decided once, by the first attempt.
+ENTRIES_DECIDED = "ENTRIES_DECIDED"
 # Orders that already moved the account: they are not repeated after a restart.
 SENT = DONE | {STOP_FAILED_CLOSED, UNPROTECTED}
+# Stop of the simulated account hit since the previous cycle; written down with the day's orders.
+STOP_HIT = "STOP_HIT"
+# Results that are not a failure of the cycle.
+RESOLVED = DONE | {NO_POSITION, ALREADY_DISPATCHED}
 LATE_WARNING_MINUTES = 5.0
 
 
@@ -174,6 +191,7 @@ class DailyRunner:
             logger.error("Cycle {}: not run, today is {} (UTC) and only today's cycle can be traded",
                          cycle_date, today)
             return {"cycle_date": cycle_date, "status": WRONG_DATE}
+        earlier_attempt = (self._store.get_cycle(cycle_date) or {}).get("incomplete")
         late = (now - self.scheduled_for(now.date())).total_seconds() / 60.0
         if late > LATE_WARNING_MINUTES:
             logger.warning("Cycle {}: starting {:.0f} minutes late", cycle_date, late)
@@ -186,15 +204,22 @@ class DailyRunner:
             logger.warning("Cycle {}: there are positions outside the basket ({}); they are managed until closed, "
                            "without buying them again", cycle_date, ", ".join(orphans))
         symbols = [*self._symbols, *orphans]
-        rules = self._executor.load_market_rules(symbols)
+        rules = self._executor.load_market_rules(symbols, refresh=True)
         market = self._loader.load(symbols)
         if not market:
             logger.error("Cycle {}: no symbol has valid daily candles; not trading", cycle_date)
             return {"cycle_date": cycle_date, "status": NO_DATA}
 
-        stopped = self._executor.settle_paper(market)
+        # Stops hit and repairs are written down at once, like orders: if the day has to be run again,
+        # its summary still has them.
+        for trade in self._executor.settle_paper(market):
+            self._store.record_dispatch(cycle_date, trade["symbol"], STOP_HIT,
+                                        {**trade, "action": STOP_HIT, "status": SIMULATED})
+        distances = self._stop_distances(market)
+        for result in self._executor.protect_open_positions(distances, cycle_date):
+            self._store.record_dispatch(cycle_date, result["symbol"], result["action"], result)
         account = self._executor.get_account()
-        positions = self._executor.get_open_positions(self._stop_distances(market))
+        positions = self._executor.get_open_positions(distances)
         if not account.wallet_balance > 0.0:
             logger.error("Cycle {}: the account has no balance ({:.2f} USDT); not trading",
                          cycle_date, account.wallet_balance)
@@ -207,35 +232,68 @@ class DailyRunner:
         )
         # Outside the basket only the exit is evaluated: without a position, the symbol is not an entry candidate.
         held = {position.symbol for position in positions}
+        blind = sorted(held - set(market))
+        if blind:
+            logger.warning("Cycle {}: no candles for {}, which are held: their exit cannot be checked today",
+                           cycle_date, ", ".join(blind))
+        # A held contract Binance no longer trades (on its way to delisting) keeps its exit checked with the
+        # last rules seen; it is never a candidate to enter.
+        specs = {symbol: rule.to_spec() for symbol, rule in rules.items()}
+        retired = sorted(held - set(rules))
+        for symbol in retired:
+            known = self._executor.known_rules(symbol)
+            if known is not None:
+                specs[symbol] = known.to_spec()
+        if retired:
+            logger.warning("Cycle {}: Binance no longer trades {}, which are held", cycle_date, ", ".join(retired))
         symbols = [symbol for symbol in symbols if symbol in self._symbols or symbol in held]
         market = {symbol: candles for symbol, candles in market.items() if symbol in symbols}
 
         self._store.mark_cycle_started(cycle_date)
-        orchestrator = BasketOrchestrator(
-            self._risk_manager, self._strategy, {symbol: rule.to_spec() for symbol, rule in rules.items()}
-        )
+        orchestrator = BasketOrchestrator(self._risk_manager, self._strategy, specs)
         intents = orchestrator.evaluate_daily_cycle(market, positions, account.wallet_balance)
         closes = [intent for intent in intents if intent.action == CLOSE_LONG]
         opens = [intent for intent in intents if intent.action == OPEN_LONG]
 
         # Closes first: they free the risk the buys were approved with.
         done = self._store.dispatched(cycle_date)
+        stopped = [entry for entry in done.values() if entry.get("action") == STOP_HIT]
+        protected = [entry for entry in done.values() if entry.get("action") == PROTECT]
         closed = [self._dispatch(cycle_date, intent, done) for intent in closes]
         block = None
-        if any(result["status"] not in DONE | {NO_POSITION, ALREADY_DISPATCHED} for result in closed):
+        if any(result["status"] not in RESOLVED for result in closed):
             block = CLOSE_FAILED
             logger.warning("Cycle {}: a close was not executed; no positions are opened today", cycle_date)
         elif opens and late > self._max_entry_delay:
             block = TOO_LATE
             logger.warning("Cycle {}: {:.0f} minutes late is over the maximum of {:g}; no positions are opened today",
                            cycle_date, late, self._max_entry_delay)
-        opened = [
-            self._dispatch(cycle_date, intent, done) if block is None else _skipped(intent, block)
-            for intent in opens
-        ]
+        if earlier_attempt is not None:
+            # Running a pending day again only finishes its exits. Its entries were settled by the first
+            # attempt, as if the cycle had run in one go: nothing new is bought and nothing is resent.
+            entry_block = earlier_attempt.get("entry_block") or ENTRIES_DECIDED
+            opened = [_as_sent(done[key]) if (key := f"{intent.symbol}:{OPEN_LONG}") in done
+                      else _skipped(intent, entry_block) for intent in opens]
+        else:
+            opened = [
+                self._dispatch(cycle_date, intent, done) if block is None else _skipped(intent, block)
+                for intent in opens
+            ]
 
+        unresolved = [result["symbol"] for result in closed if result["status"] not in RESOLVED]
+        # Only a symbol that still trades can get its candles back later the same day.
+        waiting = [symbol for symbol in blind if symbol in rules]
+        if (unresolved or waiting) and late < self._max_entry_delay:
+            logger.warning("Cycle {}: left pending ({}); it runs again later without resending what was sent",
+                           cycle_date, ", ".join([*unresolved, *waiting]))
+            first_block = earlier_attempt.get("entry_block") if earlier_attempt is not None else block
+            self._store.mark_cycle_incomplete(cycle_date, first_block)
+            return {"cycle_date": cycle_date, "status": INCOMPLETE, "unresolved": unresolved, "without_data": blind}
+        # A day run more than once: what earlier attempts sent is part of it even when this attempt no longer
+        # produces it (the position it opened or closed has changed since).
+        closed, opened = _with_earlier(done, CLOSE_LONG, closed), _with_earlier(done, OPEN_LONG, opened)
         results = [*closed, *opened]
-        failed = [result for result in results if result["status"] not in DONE | {NO_POSITION, ALREADY_DISPATCHED}]
+        failed = [result for result in results if result["status"] not in RESOLVED]
         summary = {
             "cycle_date": cycle_date,
             "status": COMPLETED_WITH_ERRORS if failed else COMPLETED,
@@ -246,6 +304,9 @@ class DailyRunner:
             "positions_before": sorted(position.symbol for position in positions),
             "symbols_with_data": len(market),
             "stopped": [trade["symbol"] for trade in stopped],
+            "protected": [_brief(result) for result in protected],
+            "without_data": blind,
+            "untradable": retired,
             "closes": [_brief(result) for result in closed],
             "opens": [_brief(result) for result in opened],
             "holds": dict(Counter(_family(intent.reason) for intent in intents
@@ -331,12 +392,17 @@ class DailyRunner:
         if previous is not None and previous.get("status") in SENT:
             logger.info("{}: {} was already sent in this cycle ({}); not repeated",
                         intent.symbol, intent.action, previous["status"])
-            return {**previous, "status": ALREADY_DISPATCHED}
+            return _as_sent(previous)
+        # The rest of a close that filled in part goes out under its own order id, and adds up with it.
+        parts = (previous.get("parts") or [previous]) if previous and previous.get("status") == PARTIAL_CLOSE else []
+        cycle_id = f"{cycle_date}-{len(parts) + 1}" if parts else cycle_date
         try:
-            result = self._executor.execute_order_intent(intent, cycle_date)
+            result = self._executor.execute_order_intent(intent, cycle_id)
         except BrokerError as error:
             logger.error("{}: {} was not executed: {}", intent.symbol, intent.action, error)
             result = _skipped(intent, ERROR, str(error))
+        if parts:
+            result = _rest_of_close(parts, result)
         self._store.record_dispatch(cycle_date, intent.symbol, intent.action, result)
         return result
 
@@ -409,6 +475,39 @@ class DailyRunner:
 def _skipped(intent: OrderIntent, status: str, reason: str = "") -> dict[str, Any]:
     return {"symbol": intent.symbol, "action": intent.action, "status": status, "reason": reason or status,
             "payloads": []}
+
+
+def _as_sent(previous: dict[str, Any]) -> dict[str, Any]:
+    """An order a previous attempt already sent. One that went through reads ALREADY_DISPATCHED; one that
+    went wrong (bought and closed again, left without stop) keeps its status, so it is not taken for done."""
+    if previous.get("status") in DONE:
+        return {**previous, "status": ALREADY_DISPATCHED}
+    return {**previous, "repeated": True}
+
+
+def _rest_of_close(parts: list[dict[str, Any]], result: dict[str, Any]) -> dict[str, Any]:
+    """A close that filled in part earlier, with what this attempt did about the rest, as one result."""
+    fills = [part for part in [*parts, result]
+             if isinstance(part.get("quantity"), (int, float)) and isinstance(part.get("price"), (int, float))
+             and part["quantity"] > 0]
+    quantity = sum(part["quantity"] for part in fills)
+    merged = {**result, "parts": [*parts, result], "quantity": quantity,
+              "price": sum(part["quantity"] * part["price"] for part in fills) / quantity if quantity else None}
+    if result.get("status") == NO_POSITION:
+        # Nothing left to sell: the rest went out some other way (its stop) between the two attempts.
+        merged.update(status=FILLED, reason="the rest went out at its stop")
+    return merged
+
+
+def _with_earlier(
+    done: dict[str, dict[str, Any]], action: str, current: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """``current`` preceded by the orders of ``action`` an earlier attempt of the day sent and this one did not."""
+    seen = {result["symbol"] for result in current}
+    earlier = [result for result in done.values()
+               if result.get("action") == action and result.get("status") in SENT | {PARTIAL_CLOSE}
+               and result.get("symbol") not in seen]
+    return [*earlier, *current]
 
 
 def _brief(result: dict[str, Any]) -> dict[str, Any]:
