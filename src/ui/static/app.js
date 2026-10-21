@@ -628,7 +628,8 @@ function renderChart(row, daily, position) {
     series.exit.setData([]);
     const periods = snapshot && snapshot.report ? snapshot.report.parameters : null;
     level(now ? now.entry_channel : row && row.high_entry, token("--accent"), periods ? `${periods.entry_period} d high` : "high", LC.LineStyle.Solid, 2);
-    level(now ? now.exit_channel : row && row.low_exit, token("--info"), periods ? `${periods.exit_period} d low` : "low", LC.LineStyle.Solid, 2);
+    // With a position the exit gets its price written on the line, below, like the stop and the entry.
+    if (!position) level(now ? now.exit_channel : row && row.low_exit, token("--info"), periods ? `${periods.exit_period} d low` : "low", LC.LineStyle.Solid, 2);
   } else {
     const today = live && daily && live.time[live.time.length - 1] > daily.time[daily.time.length - 1]
       ? live.time[live.time.length - 1] : null;
@@ -645,6 +646,11 @@ function renderChart(row, daily, position) {
   level(stop, token("--bad"), held ? `active stop ${price(stop)}` : "stop", held ? LC.LineStyle.Solid : LC.LineStyle.Dashed, held ? 3 : 2);
   // The real entry of an open position, as visible as its stop, on every interval.
   if (position) level(position.entry_price, token("--good"), `entry ${price(position.entry_price)}`, LC.LineStyle.Solid, 2);
+  // And the exit channel the next cycle will use, as a labelled level on every interval: the stop and the
+  // channel are the two prices at which the position sells by itself.
+  const exitPeriod = snapshot && snapshot.report ? snapshot.report.parameters.exit_period : 10;
+  const exitLevel = now && isNumber(now.exit_channel) ? now.exit_channel : row && row.low_exit;
+  if (position) level(exitLevel, token("--info"), `${exitPeriod} d low ${price(exitLevel)}`, LC.LineStyle.Solid, 2);
   $("legend-buy").hidden = !position;
 
   $("chart-note").textContent = intraday ? `${label} candles, UTC time. The last one is still open.`

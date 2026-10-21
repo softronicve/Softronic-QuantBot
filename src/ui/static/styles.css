@@ -387,7 +387,18 @@ footer { padding: 0 24px 24px; color: var(--muted); font-size: 12px; text-align:
     linear-gradient(45deg, rgba(255,255,255,.018) 25%, transparent 25%, transparent 75%, rgba(255,255,255,.018) 75%);
   background-size: 24px 24px; background-position: 0 0, 12px 12px;
 }
+.room { position: relative; }
 .room .execution { grid-column: span 2; }
+/* The pipeline between desks and the packet that travels it, drawn under the desks. */
+.room .flow { position: absolute; inset: 0; z-index: 2; width: 100%; height: 100%; pointer-events: none; }
+.room .station { position: relative; z-index: 1; }
+.station .bubble {
+  position: absolute; top: -12px; right: 14px; max-width: 70%; padding: 4px 8px;
+  font: 12px var(--mono); color: #05080b; background: var(--ink); border-radius: 2px;
+  opacity: 0; transform: translateY(4px); transition: opacity .25s, transform .25s; pointer-events: none;
+}
+.station .bubble::after { content: ""; position: absolute; left: 14px; bottom: -6px; border: 6px solid transparent; border-top-color: var(--ink); border-bottom: 0; }
+.station .bubble.shown { opacity: 1; transform: none; }
 .station {
   --light: var(--info);
   display: grid; grid-template-columns: 64px 1fr; grid-template-areas: "screen screen" "avatar plate";
@@ -418,9 +429,15 @@ footer { padding: 0 24px 24px; color: var(--muted); font-size: 12px; text-align:
 .lamp[data-light="idle"] { --light: var(--info); }
 .station[data-light="alert"] .lamp { animation: lamp-blink 1.2s steps(2, jump-none) infinite; }
 @keyframes lamp-blink { 50% { opacity: .25; } }
-@media (prefers-reduced-motion: reduce) { .station[data-light="alert"] .lamp { animation: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .station[data-light="alert"] .lamp { animation: none; }
+  .station .bubble { transition: none; }
+}
 
-.desk-detail { padding: 14px 16px; border: 1px solid var(--rule); border-radius: 4px; background: var(--surface); }
+.desk-detail { padding: 14px 16px; }
+.desk-dialog { width: min(920px, 94vw); max-height: 88vh; padding: 0; color: var(--ink); background: var(--surface); border: 1px solid var(--rule); }
+.desk-dialog::backdrop { background: rgba(0,0,0,.6); }
+.desk-dialog .dialog-head { position: sticky; top: 0; z-index: 1; display: flex; justify-content: flex-end; padding: 8px; background: var(--surface); border-bottom: 1px solid var(--rule); }
 .desk-detail h3 { margin: 0 0 10px; font-size: 15px; }
 .desk-detail h3 small { color: var(--muted); font-weight: 400; }
 .desk-detail h4 { margin: 14px 0 6px; font-size: 13px; color: var(--ink-2); }

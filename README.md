@@ -54,7 +54,10 @@ The report shows, for each open position, its stop, its exit channel and which
 of the two would sell it first, the result in R and the best and worst price
 since the entry. It follows closed trades after the exit, measures the
 correlation of the basket on the days it fell, and compares the record with
-holding BTC and with an equal-weight basket.
+holding BTC and with an equal-weight basket. It also reports FinRL's turbulence
+index, the edge ratio of the breakout signal over the candles it holds, and each
+closed trade in R; with fewer than 30 closed trades it says those figures
+describe rather than prove anything.
 
 There are three modes:
 
@@ -150,7 +153,7 @@ places no orders and changes nothing.
 | Analytics | Closed-trade statistics, result per coin, execution cost against the signal close, correlation matrix |
 | Market | The basket as a sortable list: price, change today, 24 h, 7 and 30 days, volume, funding, distance to its high |
 | Chart | Candles from 5 minutes to 1 day with the bot's levels, and the real entry and active stop of an open position; live order book, tape, open interest and positioning |
-| Quant floor | The same cycle as five desks (data, signal, risk, trading and stops, audit), each with a status light and its detail |
+| Quant floor | The same cycle as five desks (data, signal, risk, trading and stops, audit) drawn as a small pixel-art office, each with a status light, live figures and its detail |
 | News and calendar | Sector headlines filtered by coin, and the economic calendar of the week |
 | Audit | History of cycles with each day's report |
 

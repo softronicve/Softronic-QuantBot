@@ -111,3 +111,11 @@ def test_the_panel_snapshot_includes_the_floor_with_live_prices(traded: Path) ->
     snapshot = _panel(traded, quotes=_quoted(110.0)).snapshot()
     (position,) = snapshot["floor"]["desks"]["execution"]["positions"]
     assert position["price"] == 110.0 and position["stop_price"] == snapshot["positions"][0]["stop_price"]
+
+
+def test_the_signal_desk_carries_turbulence_and_the_edge_ratio(tmp_path: Path) -> None:
+    report = _report(tmp_path)
+    report["observations"]["turbulence"] = {"value": 1.2, "raw": 4.8, "coins": 4, "lookback": 252,
+                                            "history_days": 40, "percentile": 97.5}
+    signal = quant_floor(report, [], {}, [])["desks"]["signal"]
+    assert signal["turbulence"]["percentile"] == 97.5 and "edge_ratio" in signal

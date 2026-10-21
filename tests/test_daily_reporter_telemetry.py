@@ -195,3 +195,90 @@ def test_the_report_with_the_new_figures_is_still_strict_json(tmp_path: Path) ->
     report = json.loads(json_path.read_text(), parse_constant=lambda name: pytest.fail(name))
     assert render_markdown(report) == markdown_path.read_text()
     assert DAY in markdown_path.read_text() and "MFE" in markdown_path.read_text()
+
+
+# --- Turbulence, signal quality and closed trades in R --------------------------
+
+from src.engine.daily_reporter import (  # noqa: E402
+    MEANINGFUL_TRADES,
+    TURBULENCE_LOOKBACK,
+    _after_exit,
+    _edge_ratio,
+    _trade_excursions,
+    _turbulence,
+    trade_quality,
+)
+
+
+def _random_market(days: int, coins: int = 4, shock: float = 0.0, seed: int = 5) -> dict[str, pd.DataFrame]:
+    rng = np.random.default_rng(seed)
+    market = {}
+    for i in range(coins):
+        returns = rng.normal(0.0, 0.01, days)
+        returns[-1] += shock * (1 if i % 2 else -1)  # coins that usually move together split apart today
+        frame = _frame(QUIET, n=days + 1)
+        frame["close"] = 100.0 * np.exp(np.concatenate([[0.0], np.cumsum(returns)]))
+        frame["high"], frame["low"] = frame["close"] * 1.01, frame["close"] * 0.99
+        market[f"C{i}USDT"] = frame
+    return market
+
+
+def test_turbulence_is_finrl_mahalanobis_reported_per_coin_and_as_a_percentile() -> None:
+    calm = _turbulence(_random_market(TURBULENCE_LOOKBACK + 40))
+    shaken = _turbulence(_random_market(TURBULENCE_LOOKBACK + 40, shock=0.08))
+    assert calm is not None and shaken is not None
+    assert calm["coins"] == 4 and calm["history_days"] == 40 and calm["lookback"] == TURBULENCE_LOOKBACK
+    assert shaken["percentile"] == 100.0 and shaken["value"] > calm["value"]
+    assert shaken["value"] == pytest.approx(shaken["raw"] / 4)
+    assert _turbulence(_random_market(TURBULENCE_LOOKBACK - 10)) is None  # not a year of history yet
+
+
+def test_the_edge_ratio_compares_breakouts_with_any_day() -> None:
+    frame = _frame(QUIET, n=400)
+    close = 100.0 + np.sin(np.arange(len(frame)) / 9.0) * 8.0  # trends that keep going after a new high
+    frame["close"], frame["high"], frame["low"] = close, close + 0.5, close - 0.5
+    edge = _edge_ratio({"AAAUSDT": frame}, STRATEGY)
+    assert edge is not None and edge["breakouts"] > 0
+    twenty = next(h for h in edge["horizons"] if h["days"] == 20)
+    assert twenty["signal"] is not None and twenty["any_day"] is not None and twenty["signals"] > 0
+    assert _edge_ratio({"AAAUSDT": _frame(QUIET, n=50)}, STRATEGY) is None
+
+
+def test_a_closed_trade_reads_its_excursions_in_r_without_the_exit_day_high() -> None:
+    frame = _frame(QUIET)
+    entry_day, exit_day = int(frame["open_time"].iloc[-6]), int(frame["open_time"].iloc[-3])
+    frame.loc[frame.index[-6:-3], "high"] = [104.0, 108.0, 103.0]
+    frame.loc[frame.index[-6:-3], "low"] = [99.0, 97.0, 98.0]
+    frame.loc[frame.index[-3], "high"] = 150.0  # the exit day: its high may have come after the fill
+    trade = {"symbol": "AAAUSDT", "quantity": 2.0, "entry_price": 100.0, "stop_price": 95.0, "exit_price": 95.0,
+             "opened_at": entry_day + 90_000, "closed_at": exit_day + 3_600_000, "pnl": -10.5}
+    excursions = _trade_excursions(trade, frame)
+    # Risk 2 × 5 = 10 USDT: best price 108 is +1.6R, worst 95 (the stop) −1R, all of it given back.
+    assert excursions == {"result_r": pytest.approx(-1.0), "mfe_r": pytest.approx(1.6), "mae_r": pytest.approx(-1.0),
+                          "giveback_r": pytest.approx(2.6)}
+    after = _after_exit(trade, frame)
+    assert after["5"] is None and after["20"] is None  # still pending
+    frame_long = _frame(QUIET, n=150)
+    exit_long = int(frame_long["open_time"].iloc[-30])
+    trade_long = {**trade, "closed_at": exit_long + 1}
+    assert _after_exit(trade_long, frame_long)["5"] == pytest.approx(
+        (float(frame_long["close"].iloc[-25]) / 95.0 - 1.0) * 100.0)
+
+
+def test_trade_quality_says_how_little_a_few_trades_mean() -> None:
+    trade = {"quantity": 1.0, "entry_price": 100.0, "stop_price": 90.0}
+    few = trade_quality([{**trade, "pnl": -10.0}, {**trade, "pnl": 20.0}, {**trade, "pnl": -9.0}])
+    assert few["trades"] == 3 and few["expectancy_r"] == pytest.approx((-1.0 + 2.0 - 0.9) / 3)
+    assert few["sqn"] is None and few["meaningful"] is False
+    many = trade_quality([{**trade, "pnl": pnl} for pnl in [20.0, -10.0] * (MEANINGFUL_TRADES // 2)])
+    results = [2.0, -1.0] * (MEANINGFUL_TRADES // 2)
+    assert many["sqn"] == pytest.approx(MEANINGFUL_TRADES ** 0.5 * np.mean(results) / np.std(results, ddof=1))
+    assert trade_quality([{"pnl": 5.0, "entry_price": 1.0, "stop_price": None, "quantity": 1.0}])["trades"] == 0
+
+
+def test_the_report_shows_the_new_quality_figures(tmp_path: Path) -> None:
+    trades = [{"symbol": "DDDUSDT", "reason": "STOP", "quantity": 2.0, "entry_price": 120.0, "exit_price": 110.0,
+               "stop_price": 110.0, "pnl": -20.0, "opened_at": 1, "closed_at": 2}]
+    markdown = render_markdown(_reporter(tmp_path).build(_snapshot(closed_trades=trades)))
+    assert "How each trade went" in markdown and "| DDDUSDT | -1.00R |" in markdown
+    assert f"SQN n/a (n = 1 < {MEANINGFUL_TRADES})" in markdown and "not evidence" in markdown
