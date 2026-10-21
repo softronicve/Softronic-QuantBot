@@ -74,6 +74,9 @@ class FuturesSettings(BaseModel):
     # Past this delay the cycle no longer opens positions (the price may be far
     # from the close that gave the signal). Exits always run.
     max_entry_delay_minutes: float = Field(default=360.0, gt=0.0)
+    # Pre-trade collar on TESTNET and LIVE: an entry whose price is further than this (in %) from the close
+    # that gave the signal is not sent. DRY_RUN only records it, so the paper account trades as it always has.
+    max_slippage_pct: float = Field(default=1.5, gt=0.0, le=50.0)
     # Port of the dashboard (python -m src.ui.dashboard).
     dashboard_port: int = Field(default=8770, ge=1, le=65535)
     # The dashboard also shows data from outside Binance (market cap, fear and
@@ -148,6 +151,23 @@ class DashboardSettings(BaseModel):
     host: str = "127.0.0.1"
 
 
+class AuditLlmSettings(BaseModel):
+    """Optional LLM review of each daily report (``src/engine/post_cycle.py``). Off by default: it costs tokens.
+
+    With it on, the report's figures are sent to Anthropic after every cycle.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = False
+    # Anthropic API key. Empty: the SDK looks for ANTHROPIC_API_KEY or a CLI profile.
+    api_key: SecretStr | None = None
+    model: str = "claude-opus-5-5"
+    effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+
+    _blank = field_validator("api_key", mode="before")(_blank_as_none)
+
+
 class Settings(BaseSettings):
     """Root of the configuration. Immutable once loaded."""
 
@@ -172,9 +192,13 @@ class Settings(BaseSettings):
     log_json: bool = False
     # If set, the log goes to this file (rotated by size) instead of the console.
     log_file: Path | None = None
+    # Dead-man's switch: this URL gets a GET after every COMPLETED daily cycle. Kept secret: it often holds a token.
+    healthcheck_ping_url: SecretStr | None = None
+    _blank_ping = field_validator("healthcheck_ping_url", mode="before")(_blank_as_none)
 
     futures: FuturesSettings = FuturesSettings()
     telegram: TelegramSettings = TelegramSettings()
+    audit_llm: AuditLlmSettings = AuditLlmSettings()
     dashboard: DashboardSettings = DashboardSettings()
 
 

@@ -224,12 +224,25 @@
     <section class="panel inspector" data-panel="inspector" aria-labelledby="inspector-title">
       <div class="panel-head">
         <h2 id="inspector-title">Asset inspector</h2>
+        <div class="segmented views" id="inspector-views" role="group" aria-label="View">
+          <button type="button" data-view="inspector" aria-pressed="true">Asset inspector</button>
+          <button type="button" data-view="floor" aria-pressed="false">Quant floor</button>
+        </div>
         <div class="inspector-tools">
           <div class="segmented" id="timeframes" role="group" aria-label="Candle interval"></div>
-          <label class="picker">Coin <select id="symbol"></select></label>
+          <label class="picker" id="symbol-picker">Moneda <select id="symbol"></select></label>
         </div>
       </div>
-      <div class="inspector-grid">
+      <div id="floor" class="floor" hidden>
+        <p class="hint" id="floor-caption"></p>
+        <div id="floor-room" class="room"></div>
+        <section id="floor-detail" class="desk-detail" aria-live="polite"></section>
+        <dialog id="floor-dialog" class="report-dialog" aria-label="Report of the day">
+          <div class="dialog-head"><button type="button" class="button" id="floor-dialog-close">Close</button></div>
+          <div id="floor-dialog-body"></div>
+        </dialog>
+      </div>
+      <div class="inspector-grid" id="inspector-body">
         <div>
           <p class="hint chart-note" id="chart-note"></p>
           <div id="chart" class="chart"></div>
@@ -237,6 +250,7 @@
             <li><span class="swatch entry"></span><span id="legend-entry">Entry channel</span></li>
             <li><span class="swatch exit"></span><span id="legend-exit">Exit channel</span></li>
             <li><span class="swatch stop"></span><span id="legend-stop">Stop</span></li>
+            <li id="legend-buy" hidden><span class="swatch buy"></span><span>Position entry</span></li>
           </ul>
           <p class="hint" id="levels"></p>
           <div class="depth" id="depth-panel">
@@ -344,6 +358,7 @@
           <dt><code>NEAR 5M</code></dt><dd>The same, in 5-minute candles (<code>15M</code>, <code>1H</code>, <code>4H</code>, <code>1D</code>)</dd>
           <dt><code>POS</code> <code>EVO</code> <code>ANA</code></dt><dd>Positions, equity curve and analytics</dd>
           <dt><code>MKT</code> <code>GP</code> <code>NEWS</code> <code>AUD</code></dt><dd>Market, chart, news and audit</dd>
+          <dt><code>FLOOR</code></dt><dd>Quant floor: the five desks of the cycle and their status</dd>
           <dt><code>WIN GP</code></dt><dd>Opens that section in another window (works with any of them)</dd>
           <dt><code>?</code></dt><dd>This help</dd>
         </dl>
@@ -358,6 +373,7 @@
   <script src="/static/analytics.js"></script>
   <script src="/static/context.js"></script>
   <script src="/static/book.js"></script>
+  <script src="/static/floor.js"></script>
   <script src="/static/shell.js"></script>
 </body>
 </html>

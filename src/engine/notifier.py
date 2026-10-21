@@ -27,6 +27,7 @@ from loguru import logger
 
 from config.settings import Settings, get_settings
 from src.atomic_file import write_atomically
+from src.engine.daily_reporter import stop_check_text
 from src.console import configure_logging
 from src.execution.binance_futures_executor import (
     CLOSED_UNPROTECTED,
@@ -223,6 +224,7 @@ def cycle_message(
     stopped: Sequence[Mapping[str, Any]],
     account: FuturesAccount | None,
     positions: Sequence[FuturesPosition] | None,
+    exit_channels: Mapping[str, float] | None = None,
 ) -> tuple[str, bool]:
     """The alert of a finished cycle and whether anything happened in it (buys, sells, stops or failures).
 
@@ -231,6 +233,7 @@ def cycle_message(
         stopped: trades closed by the simulated stop since the previous cycle.
         account: the account after the orders; ``None`` if it could not be read.
         positions: the positions after the orders.
+        exit_channels: exit channel (lowest low of the exit period) of each held symbol, shown next to its stop.
     """
     opens, closes = list(summary.get("opens", [])), list(summary.get("closes", []))
     bought = [order for order in opens if order.get("status") in EXECUTED]
@@ -268,9 +271,22 @@ def cycle_message(
         lines.append("No changes: no buys or sells.")
     if account is not None and positions is not None:
         equity = account.wallet_balance + account.unrealized_pnl
-        held = ", ".join(_coin(position.symbol) for position in positions) or "none"
+        heat = sum(position.quantity * max(position.entry_price - position.stop_price, 0.0)
+                   for position in positions if position.stop_price is not None and position.quantity > 0.0)
+        heat_pct = heat / account.wallet_balance * 100.0 if account.wallet_balance > 0.0 else 0.0
         lines.append(f"Account: {_number(equity)} USDT (unrealized PnL {_signed(account.unrealized_pnl)})")
-        lines.append(f"Positions ({len(positions)}): {held}")
+        lines.append(f"Balance {_number(account.wallet_balance)} USDT · open risk {_number(heat_pct)} %")
+        lines.append(f"Positions ({len(positions)}){':' if positions else ': none'}")
+        channels = exit_channels or {}
+        lines += [
+            f"• {_coin(position.symbol)}: entry {_price(position.entry_price)} · stop "
+            f"{_price(position.stop_price) if position.stop_price is not None else 'NONE'}"
+            + (f" · exit channel {_price(channels[position.symbol])}" if position.symbol in channels else "")
+            + f" · {_signed(position.quantity * (position.mark_price - position.entry_price))} USDT"
+            for position in positions
+        ]
+    if summary.get("stop_check") is not None:
+        lines.append(f"Stops: {stop_check_text(summary['stop_check'])}")
     return "\n".join(lines), eventful
 
 

@@ -58,12 +58,18 @@ function runCommand(text) {
   let understood = false;
   let destination = null;
   for (const word of words) {
-    if (SECTIONS[word]) {
+    if (word === "SALA" || word === "FLOOR") {
+      showView("floor");
+      destination = "inspector";
+    } else if (SECTIONS[word]) {
       destination = SECTIONS[word];
+      if (word === "GP") showView("inspector");
     } else if (TIMEFRAME_WORDS[word]) {
+      if (floorView) showView("inspector");
       setTimeframe(TIMEFRAME_WORDS[word]);
       destination = destination || "inspector";
     } else if (basketSymbol(word)) {
+      if (floorView) showView("inspector");
       select(basketSymbol(word));
       destination = destination || "inspector";
     } else {

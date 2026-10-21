@@ -84,6 +84,9 @@ BELOW_MIN_NOTIONAL = "BELOW_MIN_NOTIONAL"
 INVALID_STOP = "INVALID_STOP"
 POSITION_EXISTS = "POSITION_EXISTS"
 NO_RULES = "NO_RULES"
+SLIPPAGE_COLLAR = "SLIPPAGE_COLLAR"
+# Slippage against the signal close from which an entry is flagged in the report (not a limit).
+SLIPPAGE_WARNING_PCT = 0.30
 
 # Whitelist: the only things this module may ask Binance for.
 FUTURES_ENDPOINTS = frozenset(
@@ -341,6 +344,7 @@ class BinanceFuturesExecutor:
         stop_working_type: str = "CONTRACT_PRICE",
         retries: int = 3,
         retry_wait_seconds: float = 2.0,
+        max_slippage_pct: float | None = None,
         client: Any | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.time,
@@ -358,6 +362,9 @@ class BinanceFuturesExecutor:
             stop_working_type: price that triggers the stop, ``CONTRACT_PRICE``
                 (the one in the candles) or ``MARK_PRICE``.
             retries: retries of a request after a transient failure.
+            max_slippage_pct: on TESTNET and LIVE, an entry whose price is
+                further than this (in %) from its signal close is refused.
+                ``None`` turns the collar off. DRY_RUN only records it.
             retry_wait_seconds: wait before the first retry; it doubles on
                 each one.
             client: ``python-binance`` client already built (for tests).
@@ -385,6 +392,7 @@ class BinanceFuturesExecutor:
         self._clock = clock
         self._rules: dict[str, MarketRules] = {}
         self._leveraged: set[str] = set()
+        self._max_slippage_pct = max_slippage_pct
         # Symbols whose last exchangeInfo said they can no longer be traded (e.g. SETTLING before a delisting).
         self._retired: set[str] = set()
         self._account_checked = False
@@ -526,6 +534,16 @@ class BinanceFuturesExecutor:
             return []
         return self._paper.settle(market_data, self.funding_rates, self._now_ms())
 
+    def open_times(self) -> dict[str, int]:
+        """When each simulated position was opened (ms). Empty outside ``DRY_RUN``: the exchange does not say."""
+        if self._paper is None:
+            return {}
+        return {symbol: int(position["opened_at"]) for symbol, position in self._paper.positions.items()}
+
+    def closed_trades(self) -> list[dict[str, Any]]:
+        """Closed trades of the simulated account, oldest first. Empty outside ``DRY_RUN``."""
+        return self._paper.trades if self._paper is not None else []
+
     def get_account(self) -> FuturesAccount:
         if self._paper is not None:
             return self._paper_account(self._paper_positions())
@@ -659,6 +677,41 @@ class BinanceFuturesExecutor:
                                 "payloads": [], "quantity": float(row["positionAmt"]), "reason": str(error)})
         return results
 
+    def verify_stops(self, stop_distances: Mapping[str, float], cycle_id: str) -> dict[str, Any]:
+        """Checks, once the day's orders are done, that every open long is protected by a stop.
+
+        On the exchange a missing stop is put back first (``protect_open_positions``); then every long must
+        have a protective sell order whose quantity, when the exchange reports it, covers the position. In
+        DRY_RUN each simulated position must carry a positive stop below its entry.
+
+        Returns:
+            ``positions`` checked, ``protected`` ones, the ``repaired`` results (``action`` = ``PROTECT``),
+            and the symbols ``uncovered`` (stop smaller than the position) or still ``unprotected``.
+        """
+        if self._paper is not None:
+            positions = self._paper.positions
+            unprotected = sorted(symbol for symbol, position in positions.items()
+                                 if not 0.0 < float(position["stop_price"]) < float(position["entry_price"]))
+            return {"positions": len(positions), "protected": len(positions) - len(unprotected), "repaired": [],
+                    "uncovered": [], "unprotected": unprotected}
+        repaired = self.protect_open_positions(stop_distances, cycle_id)
+        rows = [row for row in self._read("futures_position_information") if float(row["positionAmt"]) > 0.0]
+        stops = self._open_stops(types=PROTECTIVE_ORDER_TYPES)
+        unprotected, uncovered = [], []
+        for row in rows:
+            sells = [stop for stop in stops.get(row["symbol"], []) if stop["side"] == "SELL"]
+            if not sells:
+                unprotected.append(row["symbol"])
+                continue
+            sizes = [stop["quantity"] for stop in sells if stop["quantity"] is not None]
+            # Only when the exchange says how much each stop sells: a closePosition stop covers everything.
+            if sizes and len(sizes) == len(sells) and sum(sizes) < float(row["positionAmt"]) * (1.0 - 1e-9):
+                uncovered.append(row["symbol"])
+        for symbol in uncovered:
+            logger.error("{}: the stop does not cover the whole position; check it", symbol)
+        return {"positions": len(rows), "protected": len(rows) - len(unprotected), "repaired": repaired,
+                "uncovered": sorted(uncovered), "unprotected": sorted(unprotected)}
+
     def _restore_stop(
         self, symbol: str, quantity: float, entry: float, distance: float | None, cycle: str,
     ) -> dict[str, Any]:
@@ -741,6 +794,14 @@ class BinanceFuturesExecutor:
         if quantity < rules.min_qty:
             return self._refuse(intent, BELOW_MIN_QTY, f"{quantity} is less than the minimum {rules.min_qty}")
         price = Decimal(str(self.mark_price(symbol)))
+        slippage = _slippage_pct(float(price), intent.signal_price)
+        if slippage is not None and abs(slippage) > SLIPPAGE_WARNING_PCT:
+            logger.warning("{}: price {} is {:+.2f} % from the signal close ({:g})", symbol, f"{price:f}",
+                           slippage, intent.signal_price)
+        collar = self._max_slippage_pct
+        if slippage is not None and collar is not None and abs(slippage) > collar and self._paper is None:
+            return self._refuse(intent, SLIPPAGE_COLLAR, f"the price {price:f} is {slippage:+.2f} % from the signal "
+                                                         f"close ({intent.signal_price:g}); the collar is {collar:g} %")
         notional = quantity * price
         if notional < rules.min_notional:
             return self._refuse(
@@ -765,7 +826,11 @@ class BinanceFuturesExecutor:
             self._log_dry("POST /fapi/v1/algoOrder", protect)
             self._paper.open(symbol, float(quantity), float(price), float(stop), self._now_ms())
             return self._result(intent, SIMULATED, quantity=float(quantity), price=float(price),
-                                stop_price=float(stop), payloads=[buy, protect])
+                                stop_price=float(stop), payloads=[buy, protect], signal_price=intent.signal_price,
+                                slippage_pct=slippage,
+                                # What TESTNET or LIVE would have done with the same price; not applied here.
+                                collar_exceeded=bool(slippage is not None and collar is not None
+                                                     and abs(slippage) > collar))
 
         self._prepare_symbol(symbol)
         filled, average = self._submit_market(buy, lambda: max(self._position_amount(symbol), 0.0))
@@ -779,7 +844,8 @@ class BinanceFuturesExecutor:
             return self._unprotected(intent, symbol, filled, average, cycle, [buy, protect], error)
         logger.info("{}: stop placed at {} (order {})", symbol, protect["triggerPrice"], stop_order.get("algoId"))
         return self._result(intent, FILLED, quantity=filled, price=average, stop_price=float(stop),
-                            stop_order_id=stop_order.get("algoId"), payloads=[buy, protect])
+                            stop_order_id=stop_order.get("algoId"), payloads=[buy, protect],
+                            signal_price=intent.signal_price, slippage_pct=_slippage_pct(average, intent.signal_price))
 
     def _unprotected(
         self, intent: OrderIntent, symbol: str, filled: float, average: float, cycle: str,
@@ -945,6 +1011,8 @@ class BinanceFuturesExecutor:
             stops.setdefault(order["symbol"], []).append({
                 "id": order.get("algoId"), "client_id": order.get("clientAlgoId"), "side": order.get("side"),
                 "trigger": float(order.get("triggerPrice") or 0.0),
+                # None when the exchange does not say (e.g. a stop that closes the whole position).
+                "quantity": float(order["quantity"]) if order.get("quantity") not in (None, "", "0") else None,
             })
         return stops
 
@@ -1026,6 +1094,13 @@ class BinanceFuturesExecutor:
     def _result(self, intent: OrderIntent, status: str, **fields: Any) -> dict[str, Any]:
         return {"symbol": intent.symbol, "action": intent.action, "status": status, "mode": self._mode,
                 "payloads": [], **fields}
+
+
+def _slippage_pct(price: float, signal_price: float | None) -> float | None:
+    """How far ``price`` is from the close that gave the signal, in %; ``None`` without a signal close."""
+    if signal_price is None or not signal_price > 0.0 or not price > 0.0:
+        return None
+    return (price / signal_price - 1.0) * 100.0
 
 
 def _not_executed_and_retryable(error: BrokerError) -> bool:

@@ -582,6 +582,7 @@ def test_serves_the_page_and_its_assets(served: tuple[str, _CountingPanel]) -> N
     for asset, expected in (("app.js", "text/javascript"), ("styles.css", "text/css"),
                             ("analytics.js", "text/javascript"), ("context.js", "text/javascript"),
                             ("book.js", "text/javascript"), ("shell.js", "text/javascript"),
+                            ("floor.js", "text/javascript"),
                             ("lightweight-charts.js", "text/javascript")):
         status, headers, body = _get(f"{base}/static/{asset}")
         assert status == 200 and headers["Content-Type"].startswith(expected) and len(body) > 1_000
@@ -591,7 +592,7 @@ def test_the_page_loads_nothing_from_other_sites(served: tuple[str, _CountingPan
     base, _ = served
     page = _get(base + "/")[2]
     scripts = re.findall(rb'<script src="(/static/[a-z-]+\.js)">', page)
-    assert len(scripts) == 6  # the charting library and the five files of the dashboard
+    assert len(scripts) == 7  # the chart library and the six dashboard files
     for path in ("/", "/static/styles.css", *(script.decode() for script in scripts)):
         body = _get(base + path)[2]
         if path.endswith("lightweight-charts.js"):
@@ -965,3 +966,19 @@ def test_a_client_that_leaves_mid_answer_is_not_an_error(served: tuple[str, _Cou
     finally:
         logger.remove(sink)
     assert log_lines == []
+
+
+def test_the_inspector_gets_what_it_needs_to_draw_the_real_entry_and_stop(traded: Path) -> None:
+    snapshot = _panel(traded, quotes=_quoted(110.0)).snapshot()
+    (now,) = snapshot["positions"]
+    (reported,) = snapshot["report"]["positions"]
+    # The lines on every interval: the real entry and the stop placed on the exchange.
+    assert isinstance(now["entry_price"], float) and isinstance(now["stop_price"], float)
+    assert now["exit_channel"] is not None and now["exit_distance_pct"] is not None
+    # The exit card: which of the two exits sells first, and the open result in R.
+    assert reported["effective_exit"] in ("stop", "canal") and reported["risk_usd"] > 0.0
+    assert {"effective_exit_price", "r_multiple", "mfe_price", "mae_price"} <= set(reported)
+
+
+def test_the_page_has_a_legend_for_the_real_entry(served: tuple[str, _CountingPanel]) -> None:
+    assert b'id="legend-buy"' in _get(served[0] + "/")[2]

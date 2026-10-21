@@ -176,7 +176,10 @@ def test_the_message_of_an_eventful_cycle() -> None:
         "STOPS",
         "• 1000PEPE: at 0.003637 · −92.72 USDT",
         "Account: 9,847.80 USDT (unrealized PnL −150.97)",
-        "Positions (2): S, NEAR",
+        "Balance 9,998.77 USDT · open risk 1.96 %",
+        "Positions (2):",
+        "• S: entry 0.061114 · stop 0.053050 · −42.37 USDT",
+        "• NEAR: entry 5.9316 · stop 5.3830 · −63.14 USDT",
     ]
 
 
@@ -187,6 +190,7 @@ def test_the_message_of_a_quiet_cycle() -> None:
         "Softronic QuantBot · DRY_RUN · cycle 2026-10-13",
         "No changes: no buys or sells.",
         "Account: 9,847.80 USDT (unrealized PnL −150.97)",
+        "Balance 9,998.77 USDT · open risk 0.00 %",
         "Positions (0): none",
     ]
     # If the account could not be read, the alert goes out without it.
@@ -285,3 +289,12 @@ def test_repairs_and_missing_candles_ask_for_attention() -> None:
         "• APT: the sell filled only in part; the rest stays open with its stop",
         "• NEAR: no candles today; its exit could not be checked",
     ]
+
+
+def test_each_position_shows_where_it_will_be_sold_and_the_stop_check() -> None:
+    check = {"positions": 2, "protected": 1, "repaired": [{"symbol": "SUSDT", "status": "STOP_RESTORED"}],
+             "uncovered": [], "unprotected": ["NEARUSDT"]}
+    text, _ = cycle_message(_summary(stop_check=check), [], ACCOUNT, POSITIONS, {"NEARUSDT": 5.21})
+    assert "• NEAR: entry 5.9316 · stop 5.3830 · exit channel 5.2100 · −63.14 USDT" in text.splitlines()
+    assert text.splitlines()[-1] == (
+        "Stops: ATTENTION: NEARUSDT WITHOUT A STOP (1 of 2 positions protected); repaired: SUSDT STOP_RESTORED")

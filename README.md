@@ -40,12 +40,21 @@ Once a day, at 00:01:30 UTC, after the daily candle has closed:
 5. An entry is skipped if it would take the open risk of the portfolio above
    4 % of the balance or its notional above 1× the balance. Leverage is fixed
    at 1.
-6. It writes a report of the day (Markdown and JSON) and, if configured, sends
-   a Telegram message.
+6. It checks that every open position ends the day with its stop, writes a
+   report of the day (Markdown and JSON) and, if configured, sends a Telegram
+   message.
 
 The same day is never run twice, an order that may have been sent is checked
 before being sent again, and a position that could not be protected with a stop
-is closed on the spot.
+is closed on the spot. On the testnet and live, an entry whose price has moved
+more than 1.5 % away from the close that gave the signal is not sent; in dry run
+that is only recorded.
+
+The report shows, for each open position, its stop, its exit channel and which
+of the two would sell it first, the result in R and the best and worst price
+since the entry. It follows closed trades after the exit, measures the
+correlation of the basket on the days it fell, and compares the record with
+holding BTC and with an equal-weight basket.
 
 There are three modes:
 
@@ -140,7 +149,8 @@ places no orders and changes nothing.
 | Equity | The account cycle by cycle, its drawdown, and BTC at the same exposure as a yardstick |
 | Analytics | Closed-trade statistics, result per coin, execution cost against the signal close, correlation matrix |
 | Market | The basket as a sortable list: price, change today, 24 h, 7 and 30 days, volume, funding, distance to its high |
-| Chart | Candles from 5 minutes to 1 day with the bot's levels; live order book, tape, open interest and positioning |
+| Chart | Candles from 5 minutes to 1 day with the bot's levels, and the real entry and active stop of an open position; live order book, tape, open interest and positioning |
+| Quant floor | The same cycle as five desks (data, signal, risk, trading and stops, audit), each with a status light and its detail |
 | News and calendar | Sector headlines filtered by coin, and the economic calendar of the week |
 | Audit | History of cycles with each day's report |
 
@@ -154,7 +164,7 @@ places no orders and changes nothing.
 
 There is a command line at the top (press `/`): `NEAR` opens that coin in the
 chart, `NEAR 5M` opens it on 5-minute candles, `POS`, `EVO`, `ANA`, `MKT`, `GP`,
-`NEWS` and `AUD` jump to each section, and `WIN GP` opens a section in its own
+`NEWS` and `AUD` jump to each section, `FLOOR` opens the quant floor, and `WIN GP` opens a section in its own
 window. On the keyboard, `j` and `k` walk the list, `1` to `5` change the
 candle interval and `?` shows the help. Every section can also be opened alone
 in a separate window, which is handy with more than one monitor.
@@ -204,6 +214,19 @@ stands. It also alerts once a day if the cycle cannot run.
 Without a token or a chat nothing is sent. An alert that fails is logged and
 never stops the cycle.
 
+## After each cycle (optional)
+
+Two more things can run once the report is written. Both are off unless you set
+them, and neither can stop or delay the trading cycle if it fails.
+
+- **Healthcheck ping.** Set `BOT_HEALTHCHECK_PING_URL` to a dead-man's-switch
+  service (healthchecks.io, Uptime Kuma and the like). It gets a GET after every
+  completed cycle, so the service raises the alarm when the pings stop.
+- **LLM auditor.** With `BOT_AUDIT_LLM__ENABLED=true` and an Anthropic API key,
+  the three questions of section 5 of the report are answered by Claude and the
+  answers are added as section 6. This sends the report's figures to Anthropic
+  and costs tokens every day.
+
 ## Configuration
 
 Everything is set through environment variables or a `.env` file; see
@@ -218,6 +241,9 @@ Everything is set through environment variables or a `.env` file; see
 | `BOT_FUTURES__MAX_POSITION_FRACTION` | `0.1` | Largest position, as a multiple of the balance |
 | `BOT_FUTURES__MAX_HEAT_PCT` | `4` | Largest open risk of the portfolio, in % |
 | `BOT_PAPER_CAPITAL` | `10000` | Starting balance of the paper account |
+| `BOT_FUTURES__MAX_SLIPPAGE_PCT` | `1.5` | On the testnet and live, entries further than this from their signal close are not sent |
+| `BOT_HEALTHCHECK_PING_URL` | empty | Gets a GET after every completed cycle |
+| `BOT_AUDIT_LLM__ENABLED` | `false` | Answers the report's questions with Claude (needs `BOT_AUDIT_LLM__API_KEY` or `ANTHROPIC_API_KEY`) |
 
 The default basket is the twelve coins the rule was measured on plus 37 more
 that we added to stress the code. The research log explains why the wider
@@ -255,13 +281,14 @@ src/engine/orchestrator.py                 Exits first, candidates by strength, 
 src/engine/state_store.py                  Which cycles ran and what each order did
 src/engine/daily_reporter.py               Daily audit report (Markdown and JSON)
 src/engine/notifier.py                     Telegram alerts
+src/engine/post_cycle.py                   Optional healthcheck ping and LLM review of the report
 src/strategies/trend_breakout.py           The 20/10 channel breakout, long only
 src/strategies/research/basket_backtest.py Point-in-time backtest of the basket
 src/risk/position_sizer.py                 ATR-based position sizing
 src/risk/portfolio_risk.py                 Portfolio limits: notional and open risk
 src/data/candle_loader.py                  Closed daily candles, checked before use
 src/execution/binance_futures_executor.py  Account, contract rules, orders and stops; paper account
-src/ui/                                    Dashboard: server, public market data, analytics, static page
+src/ui/                                    Dashboard: server, public market data, analytics, quant floor, static page
 tests/                                     Test suite
 docs/research.md                           What was measured and what came out
 ```
