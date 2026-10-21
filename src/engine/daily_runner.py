@@ -51,6 +51,7 @@ from src.data.candle_loader import DailyCandleLoader
 from src.engine.daily_reporter import CycleSnapshot, DailyReporter
 from src.engine.notifier import Notifier, build_notifier, cycle_message, failure_message
 from src.engine.orchestrator import CLOSE_LONG, OPEN_LONG, BasketOrchestrator, OrderIntent
+from src.engine.post_cycle import LlmAuditor, ping_healthcheck
 from src.engine.state_store import DailyStateStore, StateError
 from src.execution.errors import BrokerError, BrokerUnavailableError
 from src.execution.binance_futures_executor import (
@@ -123,6 +124,8 @@ class DailyRunner:
         reporter: DailyReporter | None = None,
         notifier: Notifier | None = None,
         notify_quiet_days: bool = True,
+        healthcheck_url: str | None = None,
+        auditor: LlmAuditor | None = None,
         run_delay_seconds: float = 90.0,
         max_entry_delay_minutes: float = 360.0,
         clock: Callable[[], float] = time.time,
@@ -140,6 +143,8 @@ class DailyRunner:
                 about the ones that could not run.
             notify_quiet_days: whether cycles with no buys, sells, stops or
                 failures send an alert too.
+            healthcheck_url: gets a GET after every COMPLETED cycle (dead-man's switch).
+            auditor: if given, answers the report's LLM questions after each cycle.
             run_delay_seconds: seconds after 00:00 UTC at which the cycle is
                 due. It lets Binance close the candle and settle funding.
             max_entry_delay_minutes: delay past which the cycle no longer
@@ -158,6 +163,8 @@ class DailyRunner:
         self._reporter = reporter
         self._notifier = notifier
         self._notify_quiet_days = notify_quiet_days
+        self._healthcheck_url = healthcheck_url
+        self._auditor = auditor
         self._run_delay = timedelta(seconds=run_delay_seconds)
         self._max_entry_delay = max_entry_delay_minutes
         self._clock = clock
@@ -289,6 +296,7 @@ class DailyRunner:
             first_block = earlier_attempt.get("entry_block") if earlier_attempt is not None else block
             self._store.mark_cycle_incomplete(cycle_date, first_block)
             return {"cycle_date": cycle_date, "status": INCOMPLETE, "unresolved": unresolved, "without_data": blind}
+        stop_check = self._verify_stops(cycle_date, distances)
         # A day run more than once: what earlier attempts sent is part of it even when this attempt no longer
         # produces it (the position it opened or closed has changed since).
         closed, opened = _with_earlier(done, CLOSE_LONG, closed), _with_earlier(done, OPEN_LONG, opened)
@@ -307,6 +315,7 @@ class DailyRunner:
             "protected": [_brief(result) for result in protected],
             "without_data": blind,
             "untradable": retired,
+            "stop_check": stop_check,
             "closes": [_brief(result) for result in closed],
             "opens": [_brief(result) for result in opened],
             "holds": dict(Counter(_family(intent.reason) for intent in intents
@@ -323,9 +332,15 @@ class DailyRunner:
         )
         # After recording the cycle: a failure writing the report or alerting must not leave the day half done.
         after = self._account_after(cycle_date)
+        paths = None
         if after is not None:
-            self._report(summary, account.wallet_balance, market, rules, intents, results, symbols, *after)
-        self._notify_cycle(summary, stopped, after)
+            paths = self._report(summary, account.wallet_balance, market, rules, intents, results, symbols, *after)
+        self._notify_cycle(summary, stopped, after, self._exit_channels(market, after))
+        # Optional, slowest last: a monitoring ping and the LLM review. Neither ever raises.
+        if summary["status"] == COMPLETED:
+            ping_healthcheck(self._healthcheck_url)
+        if self._auditor is not None and paths is not None:
+            self._auditor.audit(paths[1], paths[0])
         return summary
 
     def _account_after(self, cycle_date: str) -> tuple[FuturesAccount, list[FuturesPosition]] | None:
@@ -342,12 +357,13 @@ class DailyRunner:
     def _notify_cycle(
         self, summary: dict[str, Any], stopped: list[dict[str, Any]],
         after: tuple[FuturesAccount, list[FuturesPosition]] | None,
+        exit_channels: dict[str, float] | None = None,
     ) -> None:
         """Send the alert about what the cycle did. Never raises."""
         if self._notifier is None:
             return
         try:
-            text, eventful = cycle_message(summary, stopped, *(after or (None, None)))
+            text, eventful = cycle_message(summary, stopped, *(after or (None, None)), exit_channels)
             if eventful or self._notify_quiet_days:
                 self._notifier.send(text)
         except Exception:
@@ -369,22 +385,71 @@ class DailyRunner:
         self, summary: dict[str, Any], balance: float, market: dict[str, pd.DataFrame], rules: dict[str, Any],
         intents: list[OrderIntent], results: list[dict[str, Any]], symbols: list[str],
         account: FuturesAccount, positions: list[FuturesPosition],
-    ) -> None:
-        """Save the cycle report. Never raises: the cycle is already done."""
+    ) -> tuple[Path, Path] | None:
+        """Writes the cycle report and returns its paths (Markdown, JSON). Never raises: the cycle is already done."""
         if self._reporter is None:
-            return
+            return None
         try:
             # The account is the one after the orders: the report shows how it ended up.
-            self._reporter.write(CycleSnapshot(
+            return self._reporter.write(CycleSnapshot(
                 cycle_date=summary["cycle_date"], mode=summary["mode"], status=summary["status"],
                 late_minutes=summary["late_minutes"], balance=balance, account=account, positions=positions,
                 market=market, rules=rules, intents=intents, results=results, symbols=symbols,
-                stopped=summary["stopped"],
+                stopped=summary["stopped"], opened_at=self._open_times(positions),
+                closed_trades=self._executor.closed_trades(), stop_check=summary.get("stop_check"),
             ))
         except BrokerError as error:
             logger.warning("Cycle {}: report not written, {}", summary["cycle_date"], error)
         except Exception:
             logger.exception("Cycle {}: report not written", summary["cycle_date"])
+        return None
+
+    def _exit_channels(
+        self, market: dict[str, pd.DataFrame], after: tuple[FuturesAccount, list[FuturesPosition]] | None,
+    ) -> dict[str, float]:
+        """Exit channel of each position held after the cycle, for the alert."""
+        channels = {}
+        for position in (after[1] if after else []):
+            try:
+                channels[position.symbol] = self._strategy.levels(market[position.symbol]).exit_channel
+            except (KeyError, StrategyError, RiskError):
+                continue
+        return channels
+
+    def _verify_stops(self, cycle_date: str, distances: dict[str, float]) -> dict[str, Any]:
+        """Every open position must end the cycle with its stop. A failure here is reported, never raised."""
+        try:
+            check = self._executor.verify_stops(distances, cycle_date)
+        except BrokerError as error:
+            logger.warning("Cycle {}: the stops could not be checked ({})", cycle_date, error)
+            return {"error": str(error)}
+        for result in check["repaired"]:
+            self._store.record_dispatch(cycle_date, result["symbol"], result["action"], result)
+        check["repaired"] = [_brief(result) for result in check["repaired"]]
+        if check["unprotected"] or check["uncovered"]:
+            logger.error("Cycle {}: positions without a stop {} or with a partial stop {}", cycle_date,
+                         check["unprotected"], check["uncovered"])
+        else:
+            logger.info("Cycle {}: stops checked, {} of {} positions protected", cycle_date,
+                        check["protected"], check["positions"])
+        return check
+
+    def _open_times(self, positions: list[FuturesPosition]) -> dict[str, int]:
+        """When each held position was opened (ms), to measure how far it has gone each way since.
+
+        The simulated account records it. On the exchange it is taken from the cycle that bought it, at the
+        cycle's scheduled time; a position bought outside the bot has none.
+        """
+        times = self._executor.open_times()
+        missing = {position.symbol for position in positions} - set(times)
+        for cycle in self._store.recent_cycles(400) if missing else []:
+            for result in cycle.get("dispatched", {}).values():
+                symbol = result.get("symbol")
+                if symbol in missing and result.get("action") == OPEN_LONG and result.get("status") in DONE:
+                    day = date.fromisoformat(cycle["cycle_date"])
+                    times[symbol] = int(self.scheduled_for(day).timestamp() * 1000)
+                    missing.discard(symbol)
+        return times
 
     def _dispatch(self, cycle_date: str, intent: OrderIntent, done: dict[str, dict[str, Any]]) -> dict[str, Any]:
         """Execute an order and record it. An exchange failure does not stop the others."""
@@ -567,6 +632,7 @@ def build_runner(settings: Settings) -> tuple[DailyRunner, InstanceLock]:
         ),
         leverage=futures.leverage,
         stop_working_type=futures.stop_working_type,
+        max_slippage_pct=futures.max_slippage_pct,
     )
     # One set of files per account: paper trading never mixes with the real thing.
     account = executor.mode.lower()
@@ -588,10 +654,27 @@ def build_runner(settings: Settings) -> tuple[DailyRunner, InstanceLock]:
         reporter=DailyReporter(reports_dir(settings, account), strategy, risk_manager),
         notifier=notifier,
         notify_quiet_days=settings.telegram.quiet_days,
+        healthcheck_url=settings.healthcheck_ping_url.get_secret_value() if settings.healthcheck_ping_url else None,
+        auditor=_auditor(settings),
         run_delay_seconds=futures.run_delay_seconds,
         max_entry_delay_minutes=futures.max_entry_delay_minutes,
     )
     return runner, lock
+
+
+def _auditor(settings: Settings) -> LlmAuditor | None:
+    """The LLM review of each report, if it was turned on. A missing SDK or key only disables it."""
+    audit = settings.audit_llm
+    if not audit.enabled:
+        return None
+    try:
+        auditor = LlmAuditor(api_key=audit.api_key.get_secret_value() if audit.api_key else None,
+                             model=audit.model, effort=audit.effort)
+    except Exception as error:  # noqa: BLE001 - optional feature; the cycle runs without it
+        logger.warning("LLM auditor off: it could not be set up ({})", type(error).__name__)
+        return None
+    logger.info("LLM auditor on ({}, effort {}): every report is sent to Anthropic", audit.model, audit.effort)
+    return auditor
 
 
 def main(argv: list[str] | None = None) -> int:

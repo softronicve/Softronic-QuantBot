@@ -642,8 +642,10 @@ function renderChart(row, daily, position) {
   const stop = held ? position.stop_price : !intraday && row && row.sizing ? row.sizing.stop_price_rounded : null;
   $("legend-stop").textContent = held ? "Position stop" : "Stop if it entered today (close − 2 ATR)";
   $("legend-stop").previousElementSibling.classList.toggle("placed", Boolean(held));
-  level(stop, token("--bad"), "stop", held ? LC.LineStyle.Solid : LC.LineStyle.Dashed, 2);
-  if (position) level(position.entry_price, token("--ink-2"), "buy", LC.LineStyle.Dotted);
+  level(stop, token("--bad"), held ? `active stop ${price(stop)}` : "stop", held ? LC.LineStyle.Solid : LC.LineStyle.Dashed, held ? 3 : 2);
+  // The real entry of an open position, as visible as its stop, on every interval.
+  if (position) level(position.entry_price, token("--good"), `entry ${price(position.entry_price)}`, LC.LineStyle.Solid, 2);
+  $("legend-buy").hidden = !position;
 
   $("chart-note").textContent = intraday ? `${label} candles, UTC time. The last one is still open.`
     : live ? "Daily candles. The last one is today's, still open; the bot will decide when it closes."
@@ -711,9 +713,42 @@ function renderMath(report, row, position) {
     step("Stop price", `${price(row.close)} − ${price(s.stop_distance)} = ${price(s.stop_price)} at tick ${units(s.tick_size)}`, price(s.stop_price_rounded)),
     step("Loss if the stop is hit", `${units(s.lots_final)} × ${price(s.stop_distance)}`, `${usd(s.risk_at_stop_usd)} (${number(s.risk_at_stop_pct)} %)`),
   );
-  replace($("position"), position ? el("p", {},
-    `In position: ${units(position.quantity)} units, entry ${price(position.entry_price)}, stop ${price(position.stop_price)}, `,
-    el("span", { class: tone(position.pnl), text: `${signed(position.pnl)} USDT` })) : null);
+  renderExitCard(report, position);
+}
+
+// The two prices at which an open position will be sold without anyone touching it, and which comes first.
+function renderExitCard(report, position) {
+  if (!position) {
+    replace($("position"));
+    return;
+  }
+  const now = (snapshot.positions || []).find((each) => each.symbol === position.symbol) || {};
+  const current = isNumber(now.price) ? now.price : position.mark_price;
+  const channel = isNumber(now.exit_channel) ? now.exit_channel : position.exit_channel;
+  const exitPeriod = report.parameters.exit_period;
+  const distance = (level) => (isNumber(level) && current > 0 ? `${signed((level / current - 1) * 100)} %` : "—");
+  const stopFirst = isNumber(position.stop_price) && (!isNumber(channel) || position.stop_price >= channel);
+  const pnl = isNumber(now.pnl_usd) ? now.pnl_usd : position.unrealized_pnl;
+  const r = isNumber(position.risk_usd) && position.risk_usd > 0 ? pnl / position.risk_usd : null;
+  const item = (term, value, detail, first) => el("div", { class: `exit-level${first ? " first" : ""}` },
+    el("dt", { text: term }), el("dd", {}, el("b", { text: value }), el("span", { text: detail })));
+  replace($("position"), el("section", { class: "exit-card", "aria-label": "Automatic sell levels" },
+    el("h4", { text: "Open position: automatic sell levels" }),
+    el("p", { class: "exit-summary" },
+      `${units(position.quantity)} units · entry ${price(position.entry_price)} · now ${price(current)} · `,
+      el("span", { class: tone(pnl), text: `${signed(pnl)} USDT` }),
+      isNumber(r) ? el("span", { class: tone(r), text: ` (${signed(r)}R)` }) : null),
+    el("dl", {},
+      item(`Stop (${number(report.parameters.stop_atr_multiple, 0)} ATR)`,
+        isNumber(position.stop_price) ? `${price(position.stop_price)} USDT` : "no stop",
+        `${distance(position.stop_price)} from the current price. An order on the exchange: it sells as soon as the price touches it.`,
+        stopFirst),
+      item(`${exitPeriod}-day channel (low ${exitPeriod})`, isNumber(channel) ? `${price(channel)} USDT` : "—",
+        `${distance(channel)} from the current price. The low of the last ${exitPeriod} candles: it rises as old lows leave the channel, and it sells when a daily candle closes below it.`,
+        !stopFirst && isNumber(channel))),
+    el("p", { class: "hint", text: stopFirst
+      ? "Today the stop is above the channel: it would sell first."
+      : "Today the channel is above the stop: it would sell first, at the daily close." })));
 }
 
 function renderInspector() {
@@ -858,6 +893,8 @@ function refreshLive() {
     renderPositions(snapshot);
     renderCurve(snapshot.performance);
     renderRadar(snapshot.report);
+    const held = snapshot.report && snapshot.report.positions.find((each) => each.symbol === selected);
+    if (held) renderExitCard(snapshot.report, held);
     loadCandles();
     runHooks("live");
   });

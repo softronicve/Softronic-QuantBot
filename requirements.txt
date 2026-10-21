@@ -4,4 +4,6 @@ numpy==2.5.3
 pydantic==2.13.5
 pydantic-settings==2.15.0
 loguru==0.7.3
+# Only for the optional LLM auditor (BOT_AUDIT_LLM__ENABLED=true).
+anthropic==1.17.0
 pytest==9.1.1

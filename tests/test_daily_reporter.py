@@ -158,7 +158,8 @@ def test_executive_summary_adds_up(tmp_path: Path) -> None:
 
 def test_positions_carry_their_risk_and_result(tmp_path: Path) -> None:
     first, second = _reporter(tmp_path).build(_snapshot())["positions"]
-    assert first == {
+    assert {key: first[key] for key in ("symbol", "quantity", "entry_price", "mark_price", "stop_price",
+                                        "nominal_usd", "risk_usd", "risk_pct", "unrealized_pnl")} == {
         "symbol": "AAAUSDT", "quantity": 10.0, "entry_price": 101.0, "mark_price": 105.0, "stop_price": 95.0,
         "nominal_usd": 1_050.0, "risk_usd": 60.0, "risk_pct": pytest.approx(0.6), "unrealized_pnl": 40.0,
     }

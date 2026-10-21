@@ -33,8 +33,14 @@ from loguru import logger
 
 from src.atomic_file import write_atomically
 from src.engine.orchestrator import CLOSE_LONG, OPEN_LONG, OrderIntent, entry_priority
-from src.execution.binance_futures_executor import DONE, FuturesAccount, FuturesPosition, MarketRules
-from src.risk.portfolio_risk import PortfolioRiskManager
+from src.execution.binance_futures_executor import (
+    DONE,
+    SLIPPAGE_WARNING_PCT,
+    FuturesAccount,
+    FuturesPosition,
+    MarketRules,
+)
+from src.risk.portfolio_risk import MAX_HEAT_EXCEEDED, PortfolioRiskManager
 from src.risk.turtle_engine import RiskError
 from src.strategies.trend_breakout import Action, StrategyError, TrendBreakoutStrategy
 
@@ -53,6 +59,16 @@ NO_DATA = "NO_DATA"
 VOLATILITY_ALERT = 2.0
 # Mean correlation between positions from which the report highlights it.
 CORRELATION_ALERT = 0.7
+# A "down day" for the tail correlation: the basket's average daily return below this.
+TAIL_DAY_RETURN = -0.01
+# Fewer down days than this in the window and the tail correlation is not reported: it would be noise.
+TAIL_MIN_DAYS = 5
+# Breakout strength (in ATR) from which a coin counts as close to breaking out.
+PRE_ALERT_STRENGTH = -1.5
+DAY_MS = 86_400_000
+# Closed trades and heat-limited breakouts followed after the fact.
+SETTLEMENT_TRADES = 20
+HEAT_DISCARD_REPORTS = 30
 
 _DECISIONS = {OPEN_LONG: Action.ENTER_LONG.value, CLOSE_LONG: Action.EXIT_LONG.value}
 
@@ -78,6 +94,12 @@ class CycleSnapshot:
     symbols: Sequence[str]
     # Positions whose stop was hit since the previous cycle.
     stopped: Sequence[str] = ()
+    # When each held position was opened (ms); a symbol missing here gets no excursion figures.
+    opened_at: Mapping[str, int] | None = None
+    # Closed trades of the account, oldest first, as the paper account keeps them.
+    closed_trades: Sequence[Mapping[str, Any]] = ()
+    # End-of-cycle check that every open position has its stop (``DailyRunner._verify_stops``).
+    stop_check: Mapping[str, Any] | None = None
 
 
 class DailyReporter:
@@ -146,10 +168,18 @@ class DailyReporter:
             self._row(symbol, cycle, intents.get(symbol), results.get(symbol), symbol in held)
             for symbol in cycle.symbols
         ]
+        rows = {row["symbol"]: row for row in basket}
+        for position in positions:
+            position.update(_exit_levels(position, rows.get(position["symbol"])))
+            position.update(_excursions(position, cycle.market.get(position["symbol"]),
+                                        (cycle.opened_at or {}).get(position["symbol"])))
         observations = {
             "volatility": [row["volatility"] for row in basket if row.get("volatility")],
             "correlation": self._correlation(cycle.market, sorted(held)),
             "execution": _execution(basket, cycle),
+            "regime": _regime(basket),
+            "benchmarks": self._benchmarks(cycle, equity),
+            "heat_discards": self._heat_discards(cycle),
         }
         report: dict[str, Any] = {
             "schema": SCHEMA,
@@ -185,6 +215,8 @@ class DailyReporter:
             },
             "positions": positions,
             "stopped": list(cycle.stopped),
+            "closed_trades": _settlement(cycle.closed_trades, cycle.market),
+            "stop_check": dict(cycle.stop_check) if cycle.stop_check is not None else None,
             "basket": basket,
             "observations": observations,
         }
@@ -282,12 +314,26 @@ class DailyReporter:
             for symbol, candles in market.items() if len(candles) > self._correlation_days
         })
         summary: dict[str, Any] = {"days": self._correlation_days, "symbols": len(returns.columns),
-                                   "basket_mean": None, "held_mean": None, "held_pairs": []}
+                                   "basket_mean": None, "held_mean": None, "held_pairs": [],
+                                   "tail_threshold_pct": TAIL_DAY_RETURN * 100.0, "tail_days": 0,
+                                   "tail_mean": None, "tail_held_mean": None, "tail_down_share_pct": None}
         if len(returns.columns) < 2:
             return summary
         matrix = returns.corr()
         summary["basket_mean"] = _mean_pairwise(matrix, list(matrix.columns))
         inside = [symbol for symbol in held if symbol in matrix.columns]
+        # Tail correlation: the same measure, only over the days the basket as a whole fell. Diversification
+        # that holds on quiet days and vanishes on the bad ones is the case it is meant to catch.
+        down = returns[np.expm1(returns).mean(axis=1) < TAIL_DAY_RETURN]
+        summary["tail_days"] = len(down)
+        if len(down) >= TAIL_MIN_DAYS:
+            # Restricting to down days narrows the range of returns, which by itself pulls a correlation
+            # down; the share of coins that fell on those days says the same thing without that bias.
+            summary["tail_down_share_pct"] = float((down < 0.0).mean(axis=1).mean() * 100.0)
+            tail = down.corr()
+            summary["tail_mean"] = _mean_pairwise(tail, list(tail.columns))
+            if len(inside) >= 2:
+                summary["tail_held_mean"] = _mean_pairwise(tail, inside)
         if len(inside) >= 2:
             summary["held_mean"] = _mean_pairwise(matrix, inside)
             pairs = [
@@ -296,6 +342,52 @@ class DailyReporter:
             ]
             summary["held_pairs"] = sorted(pairs, key=lambda pair: -pair["correlation"])[:5]
         return summary
+
+    def _earlier_reports(self, cycle_date: str) -> list[dict[str, Any]]:
+        """Reports of earlier cycles in this folder, oldest first. Unreadable ones are skipped."""
+        reports = []
+        for path in sorted(self._directory.glob(f"{REPORT_PREFIX}*.json")):
+            if path.stem.removeprefix(REPORT_PREFIX) >= cycle_date:
+                continue
+            try:
+                reports.append(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, ValueError) as error:
+                logger.warning("Unreadable earlier report, skipped: {} ({})", path.name, error)
+        return reports
+
+    def _benchmarks(self, cycle: CycleSnapshot, equity: float) -> dict[str, Any] | None:
+        """Return since the first report against holding BTC and against an equal-weight basket, both passive."""
+        earlier = self._earlier_reports(cycle.cycle_date)
+        if not earlier:
+            return None
+        first = earlier[0]
+        start_equity = (first.get("account") or {}).get("equity")
+        # The first cycle traded on the candle that closed the day before it.
+        start_open = _day_ms(first["cycle_date"]) - DAY_MS
+        changes = {symbol: change for symbol, candles in cycle.market.items()
+                   if (change := _change_since(candles, start_open)) is not None}
+        return {
+            "since": first["cycle_date"],
+            "bot_pct": (equity / start_equity - 1.0) * 100.0 if start_equity else None,
+            "btc_pct": changes.get("BTCUSDT"),
+            "basket_pct": sum(changes.values()) / len(changes) if changes else None,
+            "basket_symbols": len(changes),
+        }
+
+    def _heat_discards(self, cycle: CycleSnapshot) -> list[dict[str, Any]]:
+        """Breakouts of earlier cycles left out by the open-risk limit, and where their price is today."""
+        discards = []
+        for report in self._earlier_reports(cycle.cycle_date)[-HEAT_DISCARD_REPORTS:]:
+            for row in report.get("basket", []):
+                if row.get("reason") != MAX_HEAT_EXCEEDED or not row.get("close"):
+                    continue
+                today = _last_close(cycle.market.get(row["symbol"]))
+                discards.append({
+                    "cycle_date": report["cycle_date"], "symbol": row["symbol"], "close": row["close"],
+                    "breakout_strength": row.get("breakout_strength"), "close_today": today,
+                    "change_pct": (today / row["close"] - 1.0) * 100.0 if today else None,
+                })
+        return discards
 
     def _market_cache(self, cycle: CycleSnapshot) -> dict[str, Any]:
         """The latest candles of each symbol with both channels, for the dashboard chart."""
@@ -347,6 +439,100 @@ def _position(position: FuturesPosition, balance: float) -> dict[str, Any]:
     }
 
 
+def _exit_levels(position: dict[str, Any], row: dict[str, Any] | None) -> dict[str, Any]:
+    """Both exits of a long, and which one would sell it first.
+
+    The stop sells as soon as the price touches it; the channel sells when a
+    daily candle closes below it. Whichever is higher is reached first.
+    """
+    stop, channel = position["stop_price"], (row or {}).get("low_exit")
+    mark = position["mark_price"]
+    levels = [(price, kind) for price, kind in ((stop, "stop"), (channel, "canal")) if price is not None]
+    nearest = max(levels) if levels else None
+    risk = position["risk_usd"]
+    return {
+        "exit_channel": channel,
+        "effective_exit": nearest[1] if nearest else None,
+        "effective_exit_price": nearest[0] if nearest else None,
+        "effective_exit_distance_pct": (nearest[0] / mark - 1.0) * 100.0 if nearest and mark > 0.0 else None,
+        # Open result in units of the risk taken at entry (to the initial stop).
+        "r_multiple": position["unrealized_pnl"] / risk if stop is not None and risk > 0.0 else None,
+    }
+
+
+def _excursions(position: dict[str, Any], candles: pd.DataFrame | None, opened_at: int | None) -> dict[str, Any]:
+    """Maximum favourable and adverse excursion since the entry, from the closed daily candles.
+
+    The candle of the entry day counts whole: the cycle buys a minute after it
+    opens. A position bought in this same cycle has no closed candle yet.
+    """
+    empty = {"mfe_price": None, "mfe_usd": None, "mfe_pct": None, "mfe_r": None,
+             "mae_price": None, "mae_usd": None, "mae_pct": None, "mae_r": None}
+    if candles is None or opened_at is None or position["quantity"] <= 0.0:
+        return empty
+    since = candles[candles["open_time"].astype("int64") >= opened_at - opened_at % DAY_MS]
+    if since.empty:
+        return empty
+    entry, quantity, risk = position["entry_price"], position["quantity"], position["risk_usd"]
+    high, low = float(since["high"].astype(float).max()), float(since["low"].astype(float).min())
+    favourable, adverse = quantity * max(high - entry, 0.0), quantity * min(low - entry, 0.0)
+    return {
+        "mfe_price": high, "mfe_usd": favourable, "mfe_pct": (high / entry - 1.0) * 100.0,
+        "mfe_r": favourable / risk if risk > 0.0 else None,
+        "mae_price": low, "mae_usd": adverse, "mae_pct": (low / entry - 1.0) * 100.0,
+        "mae_r": adverse / risk if risk > 0.0 else None,
+    }
+
+
+def _settlement(trades: Sequence[Mapping[str, Any]], market: Mapping[str, pd.DataFrame]) -> list[dict[str, Any]]:
+    """Closed trades, most recent first, with what their price did after the exit.
+
+    ``protected_usd`` is what the exit saved (positive) or gave up (negative)
+    against still holding the same quantity at today's close.
+    """
+    settled = []
+    for trade in list(trades)[-SETTLEMENT_TRADES:][::-1]:
+        today = _last_close(market.get(str(trade.get("symbol"))))
+        exit_price, quantity = trade.get("exit_price"), trade.get("quantity")
+        settled.append({
+            "symbol": trade.get("symbol"), "reason": trade.get("reason"),
+            "entry_price": trade.get("entry_price"), "exit_price": exit_price, "quantity": quantity,
+            "pnl": trade.get("pnl"), "opened_at": trade.get("opened_at"), "closed_at": trade.get("closed_at"),
+            "close_today": today,
+            "after_exit_pct": (today / exit_price - 1.0) * 100.0 if today and exit_price else None,
+            "protected_usd": quantity * (exit_price - today) if today and exit_price and quantity else None,
+        })
+    return settled
+
+
+def _regime(basket: list[dict[str, Any]]) -> dict[str, Any]:
+    """How much of the basket is breaking out, close to it, or below its exit channel today."""
+    measured = [row for row in basket if row.get("breakout_strength") is not None]
+    return {
+        "symbols": len(measured),
+        "breaking_out": sum(row["breakout_strength"] > 0.0 for row in measured),
+        "pre_alert": sum(PRE_ALERT_STRENGTH < row["breakout_strength"] <= 0.0 for row in measured),
+        "pre_alert_from": PRE_ALERT_STRENGTH,
+        "below_exit_channel": sum(row["close"] < row["low_exit"] for row in measured),
+    }
+
+
+def _last_close(candles: pd.DataFrame | None) -> float | None:
+    return float(candles["close"].iloc[-1]) if candles is not None and len(candles) else None
+
+
+def _change_since(candles: pd.DataFrame, open_ms: int) -> float | None:
+    """Change in % from the close of the candle that opened at ``open_ms`` to the last close."""
+    start = candles[candles["open_time"].astype("int64") == open_ms]
+    if start.empty:
+        return None
+    return (float(candles["close"].iloc[-1]) / float(start["close"].iloc[0]) - 1.0) * 100.0
+
+
+def _day_ms(cycle_date: str) -> int:
+    return int(datetime.fromisoformat(cycle_date).replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
 def _volatility(symbol: str, candles: pd.DataFrame, atr: float) -> dict[str, Any] | None:
     if len(candles) < 2 or not atr > 0.0:
         return None
@@ -366,16 +552,22 @@ def _volatility(symbol: str, candles: pd.DataFrame, atr: float) -> dict[str, Any
 
 def _execution(basket: list[dict[str, Any]], cycle: CycleSnapshot) -> list[dict[str, Any]]:
     """What happened to each order: executed (and how far from the close that gave the signal) or discarded."""
-    closes = {row["symbol"]: row.get("close") for row in basket}
+    rows = {row["symbol"]: row for row in basket}
     notes = []
     for result in cycle.results:
         note = {"symbol": result["symbol"], "action": result.get("action"), "status": result.get("status"),
                 "reason": result.get("reason"), "executed": result.get("status") in DONE}
-        price, close = result.get("price"), closes.get(result["symbol"])
+        row = rows.get(result["symbol"]) or {}
+        price, close, atr = result.get("price"), row.get("close"), row.get("atr")
         if note["executed"] and price and close:
             note["price"] = price
             note["signal_close"] = close
             note["slippage_pct"] = (price / close - 1.0) * 100.0
+            if result.get("action") == OPEN_LONG:
+                note["slippage_atr"] = (price - close) / atr if atr else None
+                note["slippage_warning"] = abs(note["slippage_pct"]) > SLIPPAGE_WARNING_PCT
+                if result.get("collar_exceeded"):
+                    note["collar_exceeded"] = True
         notes.append(note)
     return notes
 
@@ -472,6 +664,7 @@ def _prompts(report: dict[str, Any]) -> list[dict[str, str]]:
         f"{correlation['days']} days): {_text(correlation['basket_mean'])}.",
         f"Open positions: {', '.join(held) if held else 'none'}.",
         f"Mean correlation between them: {_text(correlation['held_mean'])}.",
+        _tail_text(correlation),
     ]
     if correlation["held_mean"] is not None and correlation["held_mean"] >= CORRELATION_ALERT:
         facts.append(f"Above {CORRELATION_ALERT:g}: the positions move almost as one.")
@@ -484,8 +677,8 @@ def _prompts(report: dict[str, Any]) -> list[dict[str, str]]:
             "Is that number consistent with the measured correlation?",
             "2. The portfolio control does not limit the number of correlated coins in crypto, only total risk and "
             "notional. Given these data, what concrete scenario would worry you and how would you detect it?",
-            "3. What additional data would you ask for to judge the concentration (for example, the correlation on "
-            "days when the market falls)?",
+            "3. Compare the correlation on down days with the one over all days: how much diversification is lost "
+            "when it is needed most, and what other figure would you ask for to judge concentration?",
         ]),
     })
 
@@ -553,6 +746,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"| Total notional leverage | {account['leverage']:.3f}x of {account['leverage_limit']:g}x max "
         f"({_usd(account['nominal_usd'])}) |",
         f"| Open positions | {account['open_positions']} |",
+        f"| Stops checked / reconciled | {stop_check_text(report.get('stop_check'))} |",
         "",
     ]
     if report["positions"]:
@@ -569,8 +763,10 @@ def render_markdown(report: dict[str, Any]) -> str:
             for p in report["positions"]
         ]
         lines.append("")
+        lines += _exit_lines(report["positions"], parameters)
     if report["stopped"]:
         lines += [f"Stops hit since the previous cycle: {', '.join(report['stopped'])}.", ""]
+    lines += _settlement_lines(report.get("closed_trades", []))
 
     lines += [
         "## 2. Basket decision matrix",
@@ -644,12 +840,20 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Mean basket correlation ({correlation['symbols']} symbols, {correlation['days']} days): "
         f"{_text(correlation['basket_mean'])}.",
         f"- Mean correlation between the open positions: {_text(correlation['held_mean'])}.",
+        f"- {_tail_text(correlation)}",
     ]
     for item in report["observations"]["execution"]:
         detail = (f"at {_price(item['price'])} against a close of {_price(item['signal_close'])} "
                   f"({item['slippage_pct']:+.3f} %)" if "slippage_pct" in item else (item.get("reason") or ""))
+        if item.get("slippage_atr") is not None:
+            detail += f", {item['slippage_atr']:+.3f} ATR"
+        if item.get("slippage_warning"):
+            detail += f" · WARNING: slippage above {SLIPPAGE_WARNING_PCT:g} %"
+        if item.get("collar_exceeded"):
+            detail += " · on TESTNET or LIVE this buy would not have been sent (over the slippage collar)"
         lines.append(f"- {item['symbol']} {item['action']}: {item['status']} {detail}".rstrip())
     lines.append("")
+    lines += _regime_lines(report["observations"], parameters)
 
     lines += [
         "## 5. Questions for the LLM",
@@ -660,7 +864,154 @@ def render_markdown(report: dict[str, Any]) -> str:
     ]
     for prompt in report["llm_prompts"]:
         lines += [f"### {prompt['title']}", "", "```text", prompt["prompt"], "```", ""]
+    if report.get("llm_audit"):
+        lines += _audit_lines(report["llm_audit"])
     return "\n".join(lines)
+
+
+def _audit_lines(audit: dict[str, Any]) -> list[str]:
+    """Section 6: the answers of the optional LLM auditor (``src/engine/post_cycle.py``)."""
+    lines = [
+        "## 6. Automatic review by the LLM auditor",
+        "",
+        f"Answers from {audit.get('model', 'a model')} to the blocks of section 5, written when the cycle finished. "
+        "It is a model's opinion on these numbers, not a check: verify it before acting on it.",
+        "",
+    ]
+    for answer in audit.get("answers", []):
+        text = ("The model declined to answer this block." if answer.get("refused")
+                else answer.get("answer") or "No answer.")
+        if answer.get("truncated"):
+            text += "\n\n(Answer cut off by length.)"
+        lines += [f"### {answer.get('title', 'Block')}", "", text, ""]
+    return lines
+
+
+def stop_check_text(check: Mapping[str, Any] | None) -> str:
+    """The end-of-cycle stop check in one line, for the report and the alert."""
+    if check is None:
+        return "not checked"
+    if check.get("error"):
+        return f"could not be checked ({check['error']})"
+    problems = [*(f"{symbol} WITHOUT A STOP" for symbol in check["unprotected"]),
+                *(f"{symbol} with a partial stop" for symbol in check["uncovered"])]
+    repaired = [f"{item['symbol']} {item['status']}" for item in check.get("repaired", [])]
+    text = ("OK" if not problems else "ATTENTION: " + ", ".join(problems)) + (
+        f" ({check['protected']} of {check['positions']} positions protected)")
+    return text + (f"; repaired: {', '.join(repaired)}" if repaired else "")
+
+
+def _exit_lines(positions: list[dict[str, Any]], parameters: dict[str, Any]) -> list[str]:
+    """Where each open position will be sold, and how far it has gone each way since the entry."""
+    lines = [
+        "#### Automatic sell levels and excursion since the entry",
+        "",
+        f"The stop sells as soon as the price touches it; the channel (low of {parameters['exit_period']} candles) "
+        "sells when a daily candle closes below it, and rises as old lows leave it. The higher one rules. R = result "
+        "in units of the initial risk (entry − stop). MFE/MAE: best and worst price since the entry, on closed daily "
+        "candles.",
+        "",
+        f"| Symbol | Initial stop | Low {parameters['exit_period']} | Sells first | Distance | Open R | "
+        "MFE | MAE |",
+        "|---|---:|---:|---|---:|---:|---:|---:|",
+    ]
+    for p in positions:
+        effective = (f"{p['effective_exit']} at {_price(p['effective_exit_price'])}"
+                     if p.get("effective_exit") else "—")
+        lines.append(
+            f"| {p['symbol']} | {_price(p['stop_price'])} | {_price(p.get('exit_channel'))} | {effective} | "
+            f"{_pct(p.get('effective_exit_distance_pct'))} | {_r(p.get('r_multiple'))} | "
+            f"{_excursion(p, 'mfe')} | {_excursion(p, 'mae')} |"
+        )
+    return [*lines, ""]
+
+
+def _settlement_lines(trades: list[dict[str, Any]]) -> list[str]:
+    """Closed trades and what the price did after each exit (deferred settlement)."""
+    if not trades:
+        return []
+    lines = [
+        "### Closed positions and post-exit audit",
+        "",
+        "Each closed position against today's close. \"Capital protected\" is what the exit saved (+) or gave up "
+        "(−) against still holding the same quantity: a hindsight estimate, not a rule of the bot.",
+        "",
+        "| Symbol | Exit reason | Entry price | Exit price | Realized PnL | Close today | "
+        "Since the exit | Capital protected (est.) |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    lines += [
+        f"| {t['symbol']} | {t.get('reason') or '—'} | {_price(t.get('entry_price'))} | {_price(t.get('exit_price'))} | "
+        f"{_usd(t.get('pnl'), signed=True)} | {_price(t.get('close_today'))} | {_pct(t.get('after_exit_pct'))} | "
+        f"{_usd(t.get('protected_usd'), signed=True)} |"
+        for t in trades
+    ]
+    protected = [t["protected_usd"] for t in trades if t.get("protected_usd") is not None]
+    if protected:
+        lines += ["", f"Taken together, the exits saved {_usd(sum(protected), signed=True)} against holding the "
+                      "positions until today." if sum(protected) >= 0 else
+                      f"Taken together, the exits gave up {_usd(-sum(protected))} against holding the positions "
+                      "until today."]
+    return [*lines, ""]
+
+
+def _regime_lines(observations: dict[str, Any], parameters: dict[str, Any]) -> list[str]:
+    """Breadth of the basket, the record against passive benchmarks, and breakouts the heat limit left out."""
+    regime, benchmarks = observations.get("regime"), observations.get("benchmarks")
+    lines = ["### Regime and basket breadth", ""]
+    if regime:
+        lines += [
+            f"- Breaking out (strength > 0): {regime['breaking_out']} of {regime['symbols']}.",
+            f"- On pre-alert (strength between {regime['pre_alert_from']:g} and 0): {regime['pre_alert']}.",
+            f"- Closed below their {parameters['exit_period']}-candle low: {regime['below_exit_channel']}.",
+        ]
+    if benchmarks:
+        lines += [
+            f"- Since the first report ({benchmarks['since']}): bot {_pct(benchmarks['bot_pct'])}, BTC buy and hold "
+            f"{_pct(benchmarks['btc_pct'])}, equal-weight basket of {benchmarks['basket_symbols']} coins "
+            f"{_pct(benchmarks['basket_pct'])}. Both benchmarks are fully invested; the bot only in what it holds.",
+        ]
+    discards = observations.get("heat_discards") or []
+    lines += ["", "Breakouts left out by the open-risk limit in earlier cycles: "
+              + ("none." if not discards else "")]
+    if discards:
+        lines += [
+            "",
+            "| Cycle | Symbol | Strength | Close then | Close today | Change |",
+            "|---|---|---:|---:|---:|---:|",
+            *[f"| {d['cycle_date']} | {d['symbol']} | {_text(d.get('breakout_strength'))} | {_price(d['close'])} | "
+              f"{_price(d.get('close_today'))} | {_pct(d.get('change_pct'))} |" for d in discards],
+        ]
+    return [*lines, ""]
+
+
+def _tail_text(correlation: dict[str, Any]) -> str:
+    days = correlation.get("tail_days", 0)
+    if correlation.get("tail_mean") is None:
+        return (f"Correlation on down days: not measured ({days} days with the basket below "
+                f"{correlation.get('tail_threshold_pct', TAIL_DAY_RETURN * 100.0):g} %, {TAIL_MIN_DAYS} needed).")
+    held = (f"; among the open ones {_text(correlation['tail_held_mean'])}"
+            if correlation.get("tail_held_mean") is not None else "")
+    return (f"Mean correlation on down days ({days} days with the basket below "
+            f"{correlation['tail_threshold_pct']:g} %): {_text(correlation['tail_mean'])}{held}. On those days "
+            f"{correlation['tail_down_share_pct']:.0f} % of the coins fell on average. Careful when comparing it with "
+            "the correlation over all days: measuring it only on down days narrows the range of returns, which by "
+            "itself pulls it down; the share of coins that fall has no such bias.")
+
+
+def _pct(value: float | None) -> str:
+    return "—" if value is None else f"{value:+.2f} %"
+
+
+def _r(value: float | None) -> str:
+    return "—" if value is None else f"{value:+.2f}R"
+
+
+def _excursion(position: dict[str, Any], kind: str) -> str:
+    if position.get(f"{kind}_price") is None:
+        return "—"
+    return (f"{_price(position[f'{kind}_price'])} ({_pct(position[f'{kind}_pct'])}, "
+            f"{_r(position.get(f'{kind}_r'))})")
 
 
 def _sizing_lines(row: dict[str, Any], parameters: dict[str, Any], rank: int) -> list[str]:

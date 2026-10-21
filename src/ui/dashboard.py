@@ -43,6 +43,7 @@ from src.engine.daily_runner import cycle_time, effective_mode, next_cycle_time,
 from src.engine.state_store import COMPLETED, DailyStateStore, StateError
 from src.ui.analytics import by_symbol, execution_quality, executions_of, trade_statistics
 from src.ui.context import MarketContext
+from src.ui.floor import quant_floor
 from src.ui.quotes import (
     PUBLIC_API,
     PUBLIC_STREAM,
@@ -189,6 +190,11 @@ class BasketPanel:
             benchmark.price if benchmark is not None else None,
             int(now.timestamp()),
         )
+        radar = _radar(
+            report, market.get("symbols", {}), prices, prices_at, set(held), stats,
+            self._funding.get()[0] if prices and self._funding is not None else {},
+        )
+        history = self._history(cycles)
         return {
             "meta": {
                 "generated_at": int(now.timestamp() * 1000),
@@ -201,17 +207,15 @@ class BasketPanel:
             "positions": positions,
             "live": live,
             "performance": performance,
-            "radar": _radar(
-                report, market.get("symbols", {}), prices, prices_at, set(held), stats,
-                self._funding.get()[0] if prices and self._funding is not None else {},
-            ),
+            "radar": radar,
             "analytics": {
                 "trades": trade_statistics(paper.get("trades") if isinstance(paper.get("trades"), list) else []),
                 "symbols": by_symbol(paper.get("trades") if isinstance(paper.get("trades"), list) else [], positions),
                 "execution": execution_quality([note for digest in digests for note in digest["executions"]]),
             },
             "market": market.get("symbols", {}),
-            "history": self._history(cycles),
+            "history": history,
+            "floor": quant_floor(report, positions, radar, history),
             "trades": self._trades(paper),
         }
 
@@ -541,7 +545,7 @@ class BasketDashboardServer(ThreadingHTTPServer):
         self.allowed_hosts = LOOPBACK_HOSTS | ({bound} if bound not in WILDCARD_ADDRESSES else set())
         self._cache_seconds = cache_seconds
         self._rebuild = threading.Lock()
-        self._cached: tuple[bytes, bytes] | None = None
+        self._cached: tuple[bytes, bytes, bytes] | None = None
         self._cached_at = 0.0
         # Only what is in this table is served: no path can get out of it.
         self.static: dict[str, tuple[bytes, str]] = {
@@ -549,6 +553,12 @@ class BasketDashboardServer(ThreadingHTTPServer):
             for path in STATIC_DIR.iterdir()
             if path.suffix in CONTENT_TYPES
         }
+
+    def floor(self) -> bytes:
+        """Only the quant floor, from the same cached snapshot."""
+        self.snapshot()
+        assert self._cached is not None
+        return self._cached[2]
 
     def snapshot(self, live_only: bool = False) -> bytes:
         """The dashboard snapshot, rebuilt at most every ``cache_seconds``.
@@ -578,11 +588,12 @@ class BasketDashboardServer(ThreadingHTTPServer):
         assert self._cached is not None
         return self._cached[1 if live_only else 0]
 
-    def _compose(self) -> tuple[bytes, bytes]:
+    def _compose(self) -> tuple[bytes, bytes, bytes]:
         full = self.panel.snapshot()
         return (
             json.dumps(full, allow_nan=False).encode("utf-8"),
             json.dumps({key: full[key] for key in LIVE_KEYS if key in full}, allow_nan=False).encode("utf-8"),
+            json.dumps(full.get("floor") or {}, allow_nan=False).encode("utf-8"),
         )
 
 
@@ -597,9 +608,9 @@ class _Handler(BaseHTTPRequestHandler):
         url = urlsplit(self.path)
         path = url.path
         query = parse_qs(url.query)
-        if path in ("/api/snapshot", "/api/live"):
+        if path in ("/api/snapshot", "/api/live", "/api/floor"):
             try:
-                body = self.server.snapshot(live_only=path == "/api/live")
+                body = self.server.floor() if path == "/api/floor" else self.server.snapshot(live_only=path == "/api/live")
             except Exception:
                 logger.exception("Could not build the basket dashboard snapshot")
                 # The detail goes to the log only: it can carry file names and paths.

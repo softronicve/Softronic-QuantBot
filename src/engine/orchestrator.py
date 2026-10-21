@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pandas as pd
@@ -87,6 +87,9 @@ class OrderIntent:
     order_type: str
     stop_loss: float | None
     reason: str
+    # Close of the daily candle that gave an entry signal: the executor measures the slippage against it.
+    # Information only, so two intents that differ just in it are the same order.
+    signal_price: float | None = field(default=None, compare=False)
 
 
 class BasketOrchestrator:
@@ -193,7 +196,8 @@ class BasketOrchestrator:
             )
             if approved:
                 opens.append(OrderIntent(candidate.symbol, OPEN_LONG, candidate.lot_size, MARKET,
-                                         candidate.stop_loss_price, candidate.reason))
+                                         candidate.stop_loss_price, candidate.reason,
+                                         signal_price=candidate.close_price))
                 projected.append(ActivePosition(candidate.symbol, LONG, candidate.nominal_value,
                                                 candidate.risk_usd, candidate.asset_class))
             else:

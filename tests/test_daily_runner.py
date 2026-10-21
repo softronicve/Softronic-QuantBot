@@ -40,6 +40,7 @@ from src.execution.binance_futures_executor import (
     STOP_RESTORED,
     DRY_RUN,
     FILLED,
+    FuturesPosition,
     LIVE,
     SIMULATED,
     TESTNET,
@@ -830,7 +831,10 @@ def test_a_cycle_that_buys_sends_its_alert(tmp_path: Path) -> None:
     assert key is None and lines[0] == f"Softronic QuantBot · DRY_RUN · cycle {TODAY}"
     assert lines[1] == "BUYS" and lines[2].startswith("• AAA: 9.615 at 104.0000 · stop ")
     # The account is the one after buying: balance minus the fee, one position.
-    assert lines[-2].startswith("Account: 9,999.50 USDT") and lines[-1] == "Positions (1): AAA"
+    assert lines[-5].startswith("Account: 9,999.50 USDT") and lines[-3] == "Positions (1):"
+    # Each position with where it will be sold, and the end-of-cycle stop check.
+    assert lines[-2].startswith("• AAA: entry 104.0000 · stop 98.1900 · exit channel ")
+    assert lines[-1] == "Stops: OK (1 of 1 positions protected)"
 
 
 def test_the_alert_tells_sales_and_stops(tmp_path: Path) -> None:
@@ -1076,3 +1080,17 @@ def test_main_reports_a_configuration_problem_without_a_traceback(
     monkeypatch.setattr(daily_runner, "configure_logging", lambda _: None)
     assert daily_runner.main(["--once"]) == 1
     assert any(line.startswith("ERROR|TESTNET mode requires BOT_FUTURES__API_KEY") for line in log)
+
+
+def test_the_entry_time_of_a_position_comes_from_the_paper_account_or_the_cycle_that_bought_it(tmp_path: Path) -> None:
+    rig = Rig(_client({"AAAUSDT": QUIET}), tmp_path)
+    rig.paper.open("AAAUSDT", 5.0, 100.0, 80.0, NOW_MS - DAY_MS)
+    held = [FuturesPosition("AAAUSDT", 5.0, 100.0, 100.0, 80.0)]
+    assert rig.runner._open_times(held) == {"AAAUSDT": NOW_MS - DAY_MS}
+
+    exchange = Rig(_client({"AAAUSDT": QUIET}), tmp_path / "x", mode=TESTNET)
+    exchange.store.record_dispatch("2026-10-05", "AAAUSDT", OPEN_LONG,
+                                   {"symbol": "AAAUSDT", "action": OPEN_LONG, "status": FILLED})
+    expected = int(exchange.runner.scheduled_for(date(2026, 10, 5)).timestamp() * 1000)
+    assert exchange.runner._open_times(held) == {"AAAUSDT": expected}
+    assert exchange.runner._open_times([FuturesPosition("ZZZUSDT", 1.0, 1.0, 1.0, None)]) == {}
