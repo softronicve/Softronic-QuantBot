@@ -236,7 +236,10 @@
       <div id="floor" class="floor" hidden>
         <p class="hint" id="floor-caption"></p>
         <div id="floor-room" class="room"></div>
-        <section id="floor-detail" class="desk-detail" aria-live="polite"></section>
+        <dialog id="floor-desk" class="desk-dialog" aria-labelledby="floor-desk-title">
+          <div class="dialog-head"><button type="button" class="button" id="floor-desk-close">Cerrar</button></div>
+          <section id="floor-detail" class="desk-detail"></section>
+        </dialog>
         <dialog id="floor-dialog" class="report-dialog" aria-label="Report of the day">
           <div class="dialog-head"><button type="button" class="button" id="floor-dialog-close">Close</button></div>
           <div id="floor-dialog-body"></div>

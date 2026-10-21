@@ -11,12 +11,17 @@ const DESKS = [
   { key: "audit", title: "Nightly auditor", role: "Chief auditor", hair: "#c8c8c8", shirt: "#aab6c3" },
 ];
 const LIGHT_NAMES = { ok: "all good", watch: "worth a look", alert: "needs attention", idle: "waiting" };
+const LIGHT_COLOURS = { ok: "--good", watch: "--accent", alert: "--bad", idle: "--info" };
 let floor = null;
-let floorDesk = "execution";
 let floorView = false;
 let floorTimer = null;
+let floorDesk = null;
+let stations = null;
+let lastCycleKey = null;
+const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
-// A seated figure at a desk, 16 × 16 pixels: hair, face, shirt, the desk edge and a monitor.
+// A seated figure at a desk, 16 × 16 pixels: hair, face, shirt, hands and the desk edge.
+// The second frame has the hands down on the keyboard: alternating the two is the typing.
 const SPRITE = [
   "................",
   "......HHHH......",
@@ -35,17 +40,18 @@ const SPRITE = [
   ".LL..........LL.",
   "................",
 ];
+const TYPING = SPRITE.map((row, y) => (y === 10 ? "...SSSSSSSSSS..." : y === 11 ? "DDDFDDDDDDDDFDDD" : row));
+// How fast each desk types: busy when there is something to do, frantic on an alert, still when idle.
+const TYPING_MS = { ok: 300, watch: 300, alert: 150, idle: 0 };
 
-function sprite(desk) {
-  const canvas = el("canvas", { class: "sprite", width: "16", height: "16", "aria-hidden": "true" });
-  const pen = canvas.getContext("2d");
+function paint(pen, desk, frame) {
   const colours = { H: desk.hair, F: "#e0b48c", E: "#1a1f26", S: desk.shirt, D: "#3a4654", L: "#222d3a" };
-  SPRITE.forEach((row, y) => [...row].forEach((cell, x) => {
-    if (!colours[cell] || !pen) return;
+  pen.clearRect(0, 0, 16, 16);
+  frame.forEach((row, y) => [...row].forEach((cell, x) => {
+    if (!colours[cell]) return;
     pen.fillStyle = colours[cell];
     pen.fillRect(x, y, 1, 1);
   }));
-  return canvas;
 }
 
 const pct = (value, decimals = 2) => (isNumber(value) ? `${signed(value, decimals)} %` : "—");
@@ -66,35 +72,227 @@ function screen(key, desk) {
   }
 }
 
-function renderFloor() {
-  const desks = (floor && floor.desks) || {};
-  replace($("floor-room"), DESKS.map((meta) => {
-    const desk = desks[meta.key] || { light: "idle" };
-    return el("button", {
-      type: "button", class: `station ${meta.key}${floorDesk === meta.key ? " active" : ""}`, "data-light": desk.light,
-      "aria-pressed": String(floorDesk === meta.key), "aria-label": `${meta.title}: ${LIGHT_NAMES[desk.light] || ""}`,
-    },
-    el("span", { class: "monitor" }, screen(meta.key, desk).map((line) => el("span", { text: line }))),
-    sprite(meta),
-    el("span", { class: "plate" }, el("i", { class: "lamp", title: LIGHT_NAMES[desk.light] }),
-      el("b", { text: meta.title }), el("small", { text: meta.role })));
+// What a desk says out loud now and then: one live figure, short.
+function remark(key, desk) {
+  switch (key) {
+    case "data": return desk.anomalies && desk.anomalies.length
+      ? `${coinOf(desk.anomalies[0].symbol)}: ${number(desk.anomalies[0].range_in_atr, 1)} ATR today`
+      : `${desk.symbols_with_data ?? "—"} of ${desk.symbols ?? "—"} up to date`;
+    case "signal": return desk.top && desk.top.length
+      ? `${coinOf(desk.top[0].symbol)} at ${number(desk.top[0].live_progress_pct ?? desk.top[0].progress_pct, 1)} % of its high`
+      : "nothing close to breaking out";
+    case "risk": return `heat ${number(desk.heat_pct)} % of ${number(desk.heat_limit_pct, 0)} %`;
+    case "execution": return desk.positions && desk.positions.length
+      ? `${coinOf(desk.positions[0].symbol)} ${signed(desk.positions[0].pnl_usd)} $` : "no positions";
+    case "audit": return desk.audit ? "review in section 6" : "questions ready to copy";
+    default: return "";
+  }
+}
+
+// The room is built once; every refresh only updates what changed, so focus and animation survive.
+function buildRoom() {
+  const room = $("floor-room");
+  const flow = el("canvas", { class: "flow", "aria-hidden": "true" });
+  stations = new Map();
+  replace(room, flow, DESKS.map((meta) => {
+    const canvas = el("canvas", { class: "sprite", width: "16", height: "16", "aria-hidden": "true" });
+    const station = {
+      meta, canvas, pen: canvas.getContext("2d"), frame: 0, frameAt: 0, monitor: el("span", { class: "monitor" }),
+      bubble: el("span", { class: "bubble", "aria-hidden": "true" }), bubbleUntil: 0, quietUntil: 0,
+    };
+    station.button = el("button", { type: "button", class: `station ${meta.key}`, "data-light": "idle" },
+      station.monitor, canvas, station.bubble,
+      el("span", { class: "plate" }, el("i", { class: "lamp" }), el("b", { text: meta.title }), el("small", { text: meta.role })));
+    station.button.addEventListener("click", () => openDesk(meta.key));
+    if (station.pen) paint(station.pen, meta, SPRITE);
+    stations.set(meta.key, station);
+    return station.button;
   }));
-  for (const button of $("floor-room").children) {
-    const key = [...button.classList].find((name) => DESKS.some((desk) => desk.key === name));
-    button.addEventListener("click", () => {
-      floorDesk = key;
-      renderFloor();
-      // On a narrow screen the detail sits below all five desks: take the reader there.
-      if (window.matchMedia("(max-width: 900px)").matches) $("floor-detail").scrollIntoView({ block: "start" });
-    });
+  stations.flow = flow;
+  new ResizeObserver(() => drawFlow(performance.now())).observe(room);
+}
+
+function updateRoom() {
+  if (!stations) buildRoom();
+  const desks = (floor && floor.desks) || {};
+  for (const [key, station] of stations) {
+    const desk = desks[key] || { light: "idle" };
+    station.button.dataset.light = desk.light;
+    station.button.setAttribute("aria-label", `${station.meta.title}: ${LIGHT_NAMES[desk.light] || ""}. Open the detail.`);
+    replace(station.monitor, screen(key, desk).map((line) => el("span", { text: line })));
+    station.text = remark(key, desk);
+    if (reduceMotion.matches) showBubble(station, Infinity);
+    else if (station.bubbleUntil > performance.now()) station.bubble.textContent = station.text;
   }
   $("floor-caption").textContent = floor && floor.cycle_date
-    ? `Cycle ${floor.cycle_date} in ${floor.mode}. Pick a desk to see its detail.` : "No cycle yet.";
-  renderDesk(floorDesk, desks[floorDesk] || { light: "idle" });
+    ? `Cycle ${floor.cycle_date} in ${floor.mode}. Pick a desk to open its detail.` : "No cycle yet.";
+  // A new cycle sends its data down the line once: intake, signal, risk, execution, audit.
+  const cycleKey = floor && floor.cycle_date ? `${floor.cycle_date}:${(desks.data || {}).completed_at || ""}` : null;
+  if (cycleKey && cycleKey !== lastCycleKey) startPacket(performance.now());
+  lastCycleKey = cycleKey;
+  if (floorDesk && $("floor-desk").open) renderDesk(floorDesk, desks[floorDesk] || { light: "idle" });
+  drawFlow(performance.now());
+  animate();
+}
+
+function showBubble(station, until) {
+  station.bubble.textContent = station.text || "";
+  station.bubble.classList.toggle("shown", Boolean(station.text));
+  station.bubbleUntil = until;
+}
+
+// --- Motion: typing, bubbles, the packet. One loop, only while the floor is on screen. ----------------
+
+let packet = null;
+let looping = false;
+
+function startPacket(now) {
+  const desks = (floor && floor.desks) || {};
+  // The packet stops, red, at the first desk that needs attention.
+  const stop = DESKS.findIndex((meta) => (desks[meta.key] || {}).light === "alert");
+  packet = { start: now, last: stop < 0 ? DESKS.length - 1 : stop, failed: stop >= 0 };
+}
+
+// The route from each desk to the next runs through the aisles, edge to edge, never across a desk:
+// side by side it is a short horizontal link; one row down it drops, runs along the aisle and drops again.
+function routes() {
+  const box = $("floor-room").getBoundingClientRect();
+  const rects = DESKS.map((meta) => {
+    const r = stations.get(meta.key).button.getBoundingClientRect();
+    return { left: r.left - box.left, right: r.right - box.left, top: r.top - box.top, bottom: r.bottom - box.top };
+  });
+  return rects.slice(0, -1).map((a, i) => {
+    const b = rects[i + 1];
+    if (b.top < a.bottom && b.left >= a.right) {
+      const y = (Math.max(a.top, b.top) + Math.min(a.bottom, b.bottom)) / 2;
+      return [[a.right, y], [b.left, y]];
+    }
+    const x = (a.left + a.right) / 2;
+    const gap = (a.bottom + b.top) / 2;
+    const target = Math.min(Math.max(x, b.left + 24), b.right - 24);
+    return [[x, a.bottom], [x, gap], [target, gap], [target, b.top]];
+  });
+}
+
+function along(points, t) {
+  const lengths = points.slice(1).map(([x, y], i) => Math.hypot(x - points[i][0], y - points[i][1]));
+  let left = t * lengths.reduce((sum, length) => sum + length, 0);
+  for (let i = 0; i < lengths.length; i += 1) {
+    if (left <= lengths[i] || i === lengths.length - 1) {
+      const share = lengths[i] ? Math.min(1, left / lengths[i]) : 0;
+      return [points[i][0] + (points[i + 1][0] - points[i][0]) * share, points[i][1] + (points[i + 1][1] - points[i][1]) * share];
+    }
+    left -= lengths[i];
+  }
+  return points[points.length - 1];
+}
+
+const HOP_MS = 650;
+
+function drawFlow(now) {
+  if (!stations || !floorView) return;
+  const flow = stations.flow;
+  const room = $("floor-room");
+  if (flow.width !== room.clientWidth || flow.height !== room.clientHeight) {
+    flow.width = room.clientWidth;
+    flow.height = room.clientHeight;
+  }
+  const pen = flow.getContext("2d");
+  if (!pen) return;
+  pen.clearRect(0, 0, flow.width, flow.height);
+  const paths = routes();
+  const css = getComputedStyle(document.documentElement);
+  // The pipeline, always visible: a dotted line from each desk to the next.
+  pen.setLineDash([2, 4]);
+  pen.lineWidth = 2;
+  pen.strokeStyle = css.getPropertyValue("--muted").trim();
+  for (const path of paths) {
+    pen.beginPath();
+    path.forEach(([x, y], i) => (i ? pen.lineTo(x, y) : pen.moveTo(x, y)));
+    pen.stroke();
+  }
+  pen.setLineDash([]);
+  if (!packet || reduceMotion.matches) return;
+  // A frame's timestamp can be a hair earlier than the moment the packet was sent.
+  const elapsed = Math.max(0, now - packet.start);
+  const hop = Math.floor(elapsed / HOP_MS);
+  if (hop >= packet.last) {
+    packet = null;
+    return;
+  }
+  const [x, y] = along(paths[hop], (elapsed % HOP_MS) / HOP_MS);
+  const desks = (floor && floor.desks) || {};
+  const light = packet.failed && hop + 1 === packet.last ? "alert" : (desks[DESKS[hop].key] || {}).light || "idle";
+  pen.fillStyle = css.getPropertyValue(LIGHT_COLOURS[light]).trim();
+  // Square, pixel-sized, snapped to whole pixels like the sprites.
+  pen.fillRect(Math.round(x) - 4, Math.round(y) - 4, 8, 8);
+}
+
+function tick(now) {
+  if (!floorView || document.hidden || reduceMotion.matches || !stations) {
+    looping = false;
+    return;
+  }
+  const desks = (floor && floor.desks) || {};
+  let shown = 0;
+  for (const station of stations.values()) {
+    const light = (desks[station.meta.key] || {}).light || "idle";
+    const every = TYPING_MS[light];
+    const frame = every ? Math.floor(now / every) % 2 : 0;
+    if (frame !== station.frame && station.pen) {
+      paint(station.pen, station.meta, frame ? TYPING : SPRITE);
+      station.frame = frame;
+    }
+    if (station.bubbleUntil && now > station.bubbleUntil) {
+      station.bubble.classList.remove("shown");
+      station.bubbleUntil = 0;
+      station.quietUntil = now + 7000 + Math.random() * 6000;
+    }
+    if (station.bubbleUntil) shown += 1;
+  }
+  // At most two bubbles at once, each up for four seconds, then a rest before that desk speaks again.
+  if (shown < 2 && (!tick.next || now > tick.next)) {
+    const ready = [...stations.values()].filter((s) => !s.bubbleUntil && now > s.quietUntil && s.text);
+    if (ready.length) showBubble(ready[Math.floor(Math.random() * ready.length)], now + 4000);
+    tick.next = now + 1800;
+  }
+  drawFlow(now);
+  requestAnimationFrame(tick);
+}
+
+function animate() {
+  if (looping || reduceMotion.matches) return;
+  looping = true;
+  requestAnimationFrame(tick);
+}
+
+reduceMotion.addEventListener("change", () => {
+  if (!stations) return;
+  for (const station of stations.values()) {
+    if (station.pen) paint(station.pen, station.meta, SPRITE);
+    if (reduceMotion.matches) showBubble(station, Infinity);
+    else { station.bubble.classList.remove("shown"); station.bubbleUntil = 0; }
+  }
+  drawFlow(performance.now());
+  animate();
+});
+
+// The deep view of one desk, in a modal: Esc closes it and focus returns to the desk.
+function openDesk(key) {
+  floorDesk = key;
+  renderDesk(key, ((floor && floor.desks) || {})[key] || { light: "idle" });
+  $("floor-desk").showModal();
 }
 
 function fact2(term, value, detail, extra) {
   return [el("dt", { text: term }), el("dd", {}, el("b", { text: value }), detail ? el("span", { text: detail }) : null, extra || null)];
+}
+
+function edgeFact(edge) {
+  const horizon = edge && edge.horizons && edge.horizons.find((h) => h.days === 20);
+  if (!horizon || !isNumber(horizon.signal)) return null;
+  return fact2("Signal edge ratio, 20 days", number(horizon.signal, 2),
+    `any day ${isNumber(horizon.any_day) ? number(horizon.any_day, 2) : "—"} · ${edge.breakouts} breakouts in the history`);
 }
 
 function gauge(value, limit, label) {
@@ -105,7 +303,7 @@ function gauge(value, limit, label) {
 
 function renderDesk(key, desk) {
   const meta = DESKS.find((each) => each.key === key);
-  const body = [el("h3", {}, el("i", { class: "lamp", "data-light": desk.light }), meta.title,
+  const body = [el("h3", { id: "floor-desk-title" }, el("i", { class: "lamp", "data-light": desk.light }), meta.title,
     el("small", { text: ` · ${LIGHT_NAMES[desk.light] || ""}` }))];
   if (key === "data") {
     body.push(el("dl", { class: "facts" },
@@ -123,7 +321,10 @@ function renderDesk(key, desk) {
       fact2("Breaking out", String(regime.breaking_out ?? "—"), `of ${regime.symbols ?? "—"} coins`),
       fact2("On pre-alert", String(regime.pre_alert ?? "—"), `strength between ${isNumber(regime.pre_alert_from) ? signed(regime.pre_alert_from, 1) : "−1.5"} and 0`),
       fact2("Below their 10-day low", String(regime.below_exit_channel ?? "—"), "at yesterday's close"),
-      bench ? fact2(`Since ${bench.since}`, `bot ${pct(bench.bot_pct)}`, `BTC ${pct(bench.btc_pct)} · basket ${pct(bench.basket_pct)}`) : null));
+      bench ? fact2(`Since ${bench.since}`, `bot ${pct(bench.bot_pct)}`, `BTC ${pct(bench.btc_pct)} · basket ${pct(bench.basket_pct)}`) : null,
+      desk.turbulence ? fact2("Turbulence", `percentile ${number(desk.turbulence.percentile, 0)}`,
+        `${number(desk.turbulence.value, 2)} per coin (FinRL, ${desk.turbulence.coins} coins, ${desk.turbulence.lookback} days)`) : null,
+      edgeFact(desk.edge_ratio)));
     body.push(el("h4", { text: "The five closest to breaking their 20-day high" }),
       el("ol", { class: "proximity" }, (desk.top || []).map((row) => {
         const progress = isNumber(row.live_progress_pct) ? row.live_progress_pct : row.progress_pct;
@@ -230,7 +431,7 @@ async function loadFloor() {
   if (!floorView || document.hidden) return;
   try {
     floor = await fetchJson("/api/floor");
-    renderFloor();
+    updateRoom();
   } catch (error) {
     $("floor-caption").textContent = `Could not read the quant floor: ${error.message}`;
   }
@@ -250,6 +451,7 @@ function showView(view) {
   if (floorView) {
     loadFloor();
     floorTimer = setInterval(loadFloor, FLOOR_MS);
+    animate();
   } else {
     redrawChart();
   }
@@ -257,7 +459,12 @@ function showView(view) {
 
 for (const button of $("inspector-views").children) button.addEventListener("click", () => showView(button.dataset.view));
 $("floor-dialog-close").addEventListener("click", () => $("floor-dialog").close());
-document.addEventListener("visibilitychange", () => { if (!document.hidden) loadFloor(); });
+$("floor-desk-close").addEventListener("click", () => $("floor-desk").close());
+$("floor-desk").addEventListener("close", () => {
+  const station = stations && stations.get(floorDesk);
+  if (station) station.button.focus();
+});
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { loadFloor(); animate(); } });
 try {
   if (localStorage.getItem("inspector-view") === "floor") showView("floor");
 } catch (error) { /* no stored choice */ }

@@ -84,7 +84,8 @@ def _signal_desk(report: dict[str, Any], rows: dict[str, Any]) -> dict[str, Any]
             "price": price, "live_progress_pct": price / target * 100.0 if price and target else None,
         })
     light = OK if regime.get("breaking_out") else WATCH if regime.get("pre_alert") else IDLE
-    return {"light": light, "regime": regime, "benchmarks": report["observations"].get("benchmarks"), "top": top}
+    return {"light": light, "regime": regime, "benchmarks": report["observations"].get("benchmarks"), "top": top,
+            "turbulence": report["observations"].get("turbulence"), "edge_ratio": report["observations"].get("edge_ratio")}
 
 
 def _risk_desk(report: dict[str, Any]) -> dict[str, Any]:

@@ -41,7 +41,7 @@ from src.execution.binance_futures_executor import (
     MarketRules,
 )
 from src.risk.portfolio_risk import MAX_HEAT_EXCEEDED, PortfolioRiskManager
-from src.risk.turtle_engine import RiskError
+from src.risk.turtle_engine import RiskError, wilder_atr
 from src.strategies.trend_breakout import Action, StrategyError, TrendBreakoutStrategy
 
 SCHEMA = 1
@@ -62,12 +62,21 @@ CORRELATION_ALERT = 0.7
 # A "down day" for the tail correlation: the basket's average daily return below this.
 TAIL_DAY_RETURN = -0.01
 # Fewer down days than this in the window and the tail correlation is not reported: it would be noise.
-TAIL_MIN_DAYS = 5
+TAIL_MIN_DAYS = 10
 # Breakout strength (in ATR) from which a coin counts as close to breaking out.
 PRE_ALERT_STRENGTH = -1.5
 DAY_MS = 86_400_000
 # Closed trades and heat-limited breakouts followed after the fact.
 SETTLEMENT_TRADES = 20
+# After an exit the price is also read a fixed number of daily closes later (TradingAgents-style
+# settlement), so trades closed on different days compare on the same horizon.
+SETTLEMENT_HORIZONS = (5, 10, 20)
+# Market turbulence (FinRL): Mahalanobis distance of today's returns from the last year of returns.
+TURBULENCE_LOOKBACK = 252
+# Edge ratio of the entry signal over the candles in the report, at these horizons in days.
+EDGE_HORIZONS = (5, 10, 20)
+# Below this many closed trades the trade statistics describe, they do not test anything.
+MEANINGFUL_TRADES = 30
 HEAT_DISCARD_REPORTS = 30
 
 _DECISIONS = {OPEN_LONG: Action.ENTER_LONG.value, CLOSE_LONG: Action.EXIT_LONG.value}
@@ -178,6 +187,9 @@ class DailyReporter:
             "correlation": self._correlation(cycle.market, sorted(held)),
             "execution": _execution(basket, cycle),
             "regime": _regime(basket),
+            "turbulence": _turbulence(cycle.market),
+            "edge_ratio": _edge_ratio(cycle.market, self._strategy),
+            "trade_quality": trade_quality(cycle.closed_trades),
             "benchmarks": self._benchmarks(cycle, equity),
             "heat_discards": self._heat_discards(cycle),
         }
@@ -492,7 +504,8 @@ def _settlement(trades: Sequence[Mapping[str, Any]], market: Mapping[str, pd.Dat
     """
     settled = []
     for trade in list(trades)[-SETTLEMENT_TRADES:][::-1]:
-        today = _last_close(market.get(str(trade.get("symbol"))))
+        candles = market.get(str(trade.get("symbol")))
+        today = _last_close(candles)
         exit_price, quantity = trade.get("exit_price"), trade.get("quantity")
         settled.append({
             "symbol": trade.get("symbol"), "reason": trade.get("reason"),
@@ -501,8 +514,159 @@ def _settlement(trades: Sequence[Mapping[str, Any]], market: Mapping[str, pd.Dat
             "close_today": today,
             "after_exit_pct": (today / exit_price - 1.0) * 100.0 if today and exit_price else None,
             "protected_usd": quantity * (exit_price - today) if today and exit_price and quantity else None,
+            **_trade_excursions(trade, candles),
+            "after_exit": _after_exit(trade, candles),
         })
     return settled
+
+
+def _trade_risk(trade: Mapping[str, Any]) -> float | None:
+    """Initial risk of a closed long: quantity × (entry − stop). None if the stop is missing or not below entry."""
+    entry, stop, quantity = trade.get("entry_price"), trade.get("stop_price"), trade.get("quantity")
+    if not all(isinstance(value, (int, float)) for value in (entry, stop, quantity)) or not entry > stop:
+        return None
+    return quantity * (entry - stop)
+
+
+def _trade_excursions(trade: Mapping[str, Any], candles: pd.DataFrame | None) -> dict[str, Any]:
+    """Best and worst price a closed trade saw, in R, and how much of its best it gave back.
+
+    The candles from the entry day up to the day before the exit count whole; the exit day only up to
+    the exit price, since it is not known whether its high came before or after the fill.
+    """
+    risk = _trade_risk(trade)
+    empty = {"result_r": None, "mfe_r": None, "mae_r": None, "giveback_r": None}
+    entry, exit_price, quantity = trade.get("entry_price"), trade.get("exit_price"), trade.get("quantity")
+    if risk is None or not isinstance(exit_price, (int, float)):
+        return empty
+    highs, lows = [exit_price], [exit_price]
+    opened, closed = trade.get("opened_at"), trade.get("closed_at")
+    if candles is not None and isinstance(opened, int) and isinstance(closed, int):
+        times = candles["open_time"].astype("int64")
+        inside = candles[(times >= opened - opened % DAY_MS) & (times < closed - closed % DAY_MS)]
+        highs += [float(value) for value in inside["high"]]
+        lows += [float(value) for value in inside["low"]]
+    result = quantity * (exit_price - entry) / risk
+    mfe = quantity * max(max(highs) - entry, 0.0) / risk
+    return {"result_r": result, "mfe_r": mfe, "mae_r": quantity * min(min(lows) - entry, 0.0) / risk,
+            "giveback_r": mfe - result}
+
+
+def _after_exit(trade: Mapping[str, Any], candles: pd.DataFrame | None) -> dict[str, float | None]:
+    """Change from the exit price to the close a fixed number of days after the exit day; None while pending."""
+    exit_price, closed = trade.get("exit_price"), trade.get("closed_at")
+    changes: dict[str, float | None] = {str(days): None for days in SETTLEMENT_HORIZONS}
+    if candles is None or not isinstance(exit_price, (int, float)) or not isinstance(closed, int) or not exit_price:
+        return changes
+    times = list(candles["open_time"].astype("int64"))
+    exit_day = closed - closed % DAY_MS
+    if exit_day not in times:
+        return changes
+    start = times.index(exit_day)
+    for days in SETTLEMENT_HORIZONS:
+        if start + days < len(candles):
+            changes[str(days)] = (float(candles["close"].iloc[start + days]) / exit_price - 1.0) * 100.0
+    return changes
+
+
+def trade_quality(trades: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Expectancy and SQN of the closed trades, in R. SQN needs at least ``MEANINGFUL_TRADES`` to be shown."""
+    results = []
+    for trade in trades:
+        risk = _trade_risk(trade)
+        if risk is not None and isinstance(trade.get("pnl"), (int, float)):
+            results.append(float(trade["pnl"]) / risk)
+    n = len(results)
+    mean = sum(results) / n if n else None
+    std = float(np.std(results, ddof=1)) if n >= 2 else None
+    return {
+        "trades": n, "expectancy_r": mean, "best_r": max(results) if results else None,
+        "worst_r": min(results) if results else None,
+        # sqrt(n) · mean(R) / std(R) (Van Tharp; vectorbt uses ddof=1). Below 30 trades it is noise.
+        "sqn": (n ** 0.5) * mean / std if n >= MEANINGFUL_TRADES and std else None,
+        "meaningful": n >= MEANINGFUL_TRADES,
+    }
+
+
+def _turbulence(market: Mapping[str, pd.DataFrame]) -> dict[str, Any] | None:
+    """FinRL's turbulence index on the basket, informational only.
+
+    Mahalanobis distance of today's daily log returns from the mean of the
+    previous ``TURBULENCE_LOOKBACK`` days, with the pseudo-inverse of their
+    covariance. Coins without a full window are left out. With p coins the raw
+    distance grows with p, so it is reported divided by p and as a percentile
+    of its own history over the candles in the report.
+    """
+    closes = pd.DataFrame({symbol: candles.set_index(candles["open_time"].astype("int64"))["close"].astype(float)
+                           for symbol, candles in market.items()}).sort_index()
+    returns = np.log(closes).diff().iloc[1:]
+    lookback = TURBULENCE_LOOKBACK
+    values = []
+    for end in range(lookback, len(returns)):
+        window = returns.iloc[end - lookback:end].dropna(axis=1)
+        today = returns.iloc[end][window.columns]
+        window, today = window.loc[:, today.notna()], today.dropna()
+        coins = len(window.columns)
+        if coins < 2 or coins >= lookback - 2:
+            continue
+        gap = (today - window.mean()).to_numpy()
+        distance = float(gap @ np.linalg.pinv(window.cov().to_numpy()) @ gap)
+        values.append((distance, coins))
+    if not values:
+        return None
+    distance, coins = values[-1]
+    history = [value for value, _ in values]
+    return {
+        "value": distance / coins, "raw": distance, "coins": coins, "lookback": lookback,
+        "history_days": len(history),
+        "percentile": sum(value <= distance for value in history) / len(history) * 100.0,
+    }
+
+
+def _edge_ratio(market: Mapping[str, pd.DataFrame], strategy: TrendBreakoutStrategy) -> dict[str, Any] | None:
+    """Edge ratio of the entry signal over every breakout in the report's candles, against any day.
+
+    For each day the close broke the high of the previous ``entry_period``
+    candles: the best and worst move over the next n days, each divided by the
+    ATR of that day; E = mean(favourable) / mean(adverse). The same over every
+    day gives the baseline, close to 1 for an entry with no edge. It measures
+    the signal on history, not the bot's fills.
+    """
+    signal = {days: ([], []) for days in EDGE_HORIZONS}
+    every = {days: ([], []) for days in EDGE_HORIZONS}
+    breakouts = 0
+    for candles in market.values():
+        high, low, close = (candles[name].astype(float).to_numpy() for name in ("high", "low", "close"))
+        if len(close) <= strategy.atr_period + max(EDGE_HORIZONS):
+            continue
+        try:
+            atr = wilder_atr(high, low, close, strategy.atr_period)
+        except RiskError:
+            continue
+        channel = pd.Series(high).rolling(strategy.entry_period).max().shift(1).to_numpy()
+        for t in range(strategy.atr_period, len(close)):
+            if not atr[t] > 0.0:
+                continue
+            is_signal = close[t] > channel[t]
+            breakouts += bool(is_signal) and t + min(EDGE_HORIZONS) < len(close)
+            for days in EDGE_HORIZONS:
+                if t + days >= len(close):
+                    continue
+                favourable = (high[t + 1:t + days + 1].max() - close[t]) / atr[t]
+                adverse = (close[t] - low[t + 1:t + days + 1].min()) / atr[t]
+                for target in ((signal, every) if is_signal else (every,)):
+                    target[days][0].append(max(favourable, 0.0))
+                    target[days][1].append(max(adverse, 0.0))
+    if not breakouts:
+        return None
+
+    def ratio(pairs: tuple[list[float], list[float]]) -> float | None:
+        up, down = pairs
+        return float(np.mean(up) / np.mean(down)) if up and np.mean(down) > 0.0 else None
+
+    return {"breakouts": breakouts,
+            "horizons": [{"days": days, "signal": ratio(signal[days]), "any_day": ratio(every[days]),
+                          "signals": len(signal[days][0])} for days in EDGE_HORIZONS]}
 
 
 def _regime(basket: list[dict[str, Any]]) -> dict[str, Any]:
@@ -665,6 +829,8 @@ def _prompts(report: dict[str, Any]) -> list[dict[str, str]]:
         f"Open positions: {', '.join(held) if held else 'none'}.",
         f"Mean correlation between them: {_text(correlation['held_mean'])}.",
         _tail_text(correlation),
+        *([f"Market turbulence (FinRL): percentile {turbulence['percentile']:.0f} of the last "
+           f"{turbulence['history_days']} days."] if (turbulence := report["observations"].get("turbulence")) else []),
     ]
     if correlation["held_mean"] is not None and correlation["held_mean"] >= CORRELATION_ALERT:
         facts.append(f"Above {CORRELATION_ALERT:g}: the positions move almost as one.")
@@ -946,6 +1112,23 @@ def _settlement_lines(trades: list[dict[str, Any]]) -> list[str]:
         f"{_usd(t.get('protected_usd'), signed=True)} |"
         for t in trades
     ]
+    horizons = " | ".join(f"+{days} d" for days in SETTLEMENT_HORIZONS)
+    lines += [
+        "",
+        "How each trade went: result, best and worst point in R, how much of its best it gave back, and where the "
+        f"price was {', '.join(str(days) for days in SETTLEMENT_HORIZONS)} daily closes after the exit "
+        "(\"pending\" until they have passed).",
+        "",
+        f"| Symbol | Result | MFE | MAE | Given back | {horizons} |",
+        "|---|---:|---:|---:|---:|" + "---:|" * len(SETTLEMENT_HORIZONS),
+    ]
+    lines += [
+        f"| {t['symbol']} | {_r(t.get('result_r'))} | {_r(t.get('mfe_r'))} | {_r(t.get('mae_r'))} | "
+        f"{_r(t.get('giveback_r'))} | "
+        + " | ".join(_pct((t.get("after_exit") or {}).get(str(days))) if (t.get("after_exit") or {}).get(str(days))
+                     is not None else "pending" for days in SETTLEMENT_HORIZONS) + " |"
+        for t in trades
+    ]
     protected = [t["protected_usd"] for t in trades if t.get("protected_usd") is not None]
     if protected:
         lines += ["", f"Taken together, the exits saved {_usd(sum(protected), signed=True)} against holding the "
@@ -971,6 +1154,14 @@ def _regime_lines(observations: dict[str, Any], parameters: dict[str, Any]) -> l
             f"{_pct(benchmarks['btc_pct'])}, equal-weight basket of {benchmarks['basket_symbols']} coins "
             f"{_pct(benchmarks['basket_pct'])}. Both benchmarks are fully invested; the bot only in what it holds.",
         ]
+    turbulence = observations.get("turbulence")
+    if turbulence:
+        lines.append(
+            f"- Turbulence (FinRL, Mahalanobis over {turbulence['coins']} coins and {turbulence['lookback']} days): "
+            f"{turbulence['value']:.2f} per coin, percentile {turbulence['percentile']:.0f} of the last "
+            f"{turbulence['history_days']} days. Above 90 the market is moving unusually; it is for information, "
+            "the bot does not use it.")
+    lines += _quality_lines(observations)
     discards = observations.get("heat_discards") or []
     lines += ["", "Breakouts left out by the open-risk limit in earlier cycles: "
               + ("none." if not discards else "")]
@@ -983,6 +1174,40 @@ def _regime_lines(observations: dict[str, Any], parameters: dict[str, Any]) -> l
               f"{_price(d.get('close_today'))} | {_pct(d.get('change_pct'))} |" for d in discards],
         ]
     return [*lines, ""]
+
+
+def _quality_lines(observations: dict[str, Any]) -> list[str]:
+    """Edge ratio of the signal on history, and the closed trades in R with how little they can say yet."""
+    lines = []
+    edge = observations.get("edge_ratio")
+    if edge:
+        lines += [
+            "",
+            f"Signal quality on history ({edge['breakouts']} breakouts in the report's candles): edge ratio = mean "
+            "best move / mean worst move, both in ATR, after the breakout. Close to 1 would be chance; it describes "
+            "the signal, not the bot's orders.",
+            "",
+            "| Horizon | After a breakout | Any day | Breakouts |",
+            "|---|---:|---:|---:|",
+            *[f"| {h['days']} days | {_ratio_text(h['signal'])} | {_ratio_text(h['any_day'])} | {h['signals']} |"
+              for h in edge["horizons"]],
+        ]
+    quality = observations.get("trade_quality") or {}
+    if quality.get("trades"):
+        sqn = f"{quality['sqn']:.2f}" if quality.get("sqn") is not None else f"n/a (n = {quality['trades']} < {MEANINGFUL_TRADES})"
+        lines += [
+            "",
+            f"Closed trades: {quality['trades']}; expectancy {_r(quality['expectancy_r'])} per trade "
+            f"(best {_r(quality['best_r'])}, worst {_r(quality['worst_r'])}); SQN {sqn}."
+            + ("" if quality.get("meaningful") else
+               f" With fewer than {MEANINGFUL_TRADES} trades these figures describe what happened; they are not "
+               "evidence about the strategy."),
+        ]
+    return lines
+
+
+def _ratio_text(value: float | None) -> str:
+    return "—" if value is None else f"{value:.2f}"
 
 
 def _tail_text(correlation: dict[str, Any]) -> str:

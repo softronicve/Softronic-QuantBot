@@ -815,6 +815,10 @@ class BinanceFuturesExecutor:
             return self._refuse(intent, INVALID_STOP, f"the stop {stop:f} is not below the price {price:f}")
         if self._has_position(symbol):
             return self._refuse(intent, POSITION_EXISTS, "there is already an open position in the symbol")
+        if self._paper is None:
+            # A sell stop left behind by a position closed by hand or liquidated would otherwise guard the new
+            # one at the old price and size, and the end-of-cycle check would count it as protection.
+            self._cancel_stops(symbol)
 
         buy = {
             "symbol": symbol, "side": "BUY", "type": "MARKET", "quantity": _text(quantity),
@@ -911,6 +915,8 @@ class BinanceFuturesExecutor:
     def _stop_payload(
         self, symbol: str, quantity: Decimal, stop: Decimal, cycle: str, kind: str = "s",
     ) -> dict[str, Any]:
+        # No priceProtect on purpose: with it the stop does not fire while last and mark price diverge,
+        # which is the crash or wick the stop is there for.
         return {
             "algoType": "CONDITIONAL", "symbol": symbol, "side": "SELL", "type": STOP_MARKET,
             "quantity": _text(quantity), "triggerPrice": _text(stop), "reduceOnly": "true",

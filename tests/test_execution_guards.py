@@ -254,3 +254,37 @@ def test_the_runner_hands_the_written_report_to_the_auditor(tmp_path: Path) -> N
     rig.run()
     assert len(claude.requests) == 3
     assert "## 6. Automatic review" in next((tmp_path / "reports").glob("*.md")).read_text()
+
+
+def test_a_stop_left_behind_is_cancelled_before_a_new_buy(tmp_path: Path) -> None:
+    executor, client = _executor(TESTNET, tmp_path, mark=100.0)
+    client.algo_orders.append({"algoId": 7, "orderType": "STOP_MARKET", "symbol": "AAAUSDT", "side": "SELL",
+                               "quantity": "9", "triggerPrice": "50"})  # from a position closed by hand
+    assert executor.execute_order_intent(_entry(), CYCLE)["status"] == FILLED
+    (stop,) = client.algo_orders
+    assert stop["algoId"] != 7 and float(stop["triggerPrice"]) == 90.0
+
+
+def test_an_unexpected_failure_has_its_own_alert_with_the_error(tmp_path: Path) -> None:
+    import threading
+
+    class Notes:
+        def __init__(self) -> None:
+            self.sent: list[tuple[str, str | None]] = []
+
+        def send(self, text: str, *, once_key: str | None = None) -> bool:
+            self.sent.append((text, once_key))
+            return True
+
+    notes = Notes()
+    rig = Rig(_client({"AAAUSDT": QUIET}), tmp_path, notifier=notes)
+    stop = threading.Event()
+
+    def boom(target_date: str | None = None) -> dict[str, Any]:
+        stop.set()
+        raise KeyError("missing field 'close'")
+
+    rig.runner.run_daily_cycle = boom  # type: ignore[method-assign]
+    rig.runner.run_forever(stop, retry_seconds=0.01)
+    ((text, key),) = notes.sent
+    assert "KeyError" in text and "missing field 'close'" in text and key.endswith(":unexpected")

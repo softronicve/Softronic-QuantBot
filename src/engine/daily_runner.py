@@ -369,12 +369,12 @@ class DailyRunner:
         except Exception:
             logger.exception("Cycle {}: alert not sent", summary["cycle_date"])
 
-    def _notify_failure(self, problem: str, retry_seconds: float | None) -> None:
-        """Send the alert, only once per day, that today's cycle could not run. Never raises."""
+    def _notify_failure(self, problem: str, retry_seconds: float | None, kind: str | None = None) -> None:
+        """Alerts, once a day per kind of failure, that today's cycle could not run. Never raises."""
         if self._notifier is None:
             return
         cycle_date = self._now().date().isoformat()
-        kind = "retry" if retry_seconds else "halt"
+        kind = kind or ("retry" if retry_seconds else "halt")
         try:
             self._notifier.send(failure_message(self._executor.mode, cycle_date, problem, retry_seconds),
                                 once_key=f"{self._executor.mode}:{cycle_date}:{kind}")
@@ -522,7 +522,9 @@ class DailyRunner:
                     raise
                 except Exception as error:
                     logger.exception("Unexpected failure in the cycle; retrying in {:g} s", retry_seconds)
-                    self._notify_failure(f"Unexpected failure ({type(error).__name__}).", retry_seconds)
+                    # Its own once-a-day key: an exchange outage alerted earlier must not hide a bug.
+                    self._notify_failure(f"Unexpected failure ({type(error).__name__}: {str(error)[:200]}).",
+                                         retry_seconds, kind="unexpected")
                     status = None
                 if status in RETRY:
                     self._notify_failure(RETRY_PROBLEMS[status], retry_seconds)
