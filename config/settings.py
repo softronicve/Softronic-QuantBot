@@ -27,18 +27,20 @@ def _blank_as_none(value: object) -> object:
 MEASURED_FUTURES_BASKET = (
     "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,AVAXUSDT,DOTUSDT,LINKUSDT,LTCUSDT,DOGEUSDT,TRXUSDT"
 )
-# Default basket of the daily cycle: the twelve measured coins plus 37 more
-# contracts, added to stress the data handling and the risk limits in DRY_RUN.
-# There is no historical measurement behind those 37. Names are the contract
-# names on Binance USDT-M Futures (1000PEPEUSDT, not PEPEUSDT; RENDER, A and S
-# are the successors of RNDR, EOS and FTM).
-DEFAULT_FUTURES_BASKET = (
-    MEASURED_FUTURES_BASKET
-    + ",NEARUSDT,ATOMUSDT,UNIUSDT,BCHUSDT,ETCUSDT,FILUSDT,ICPUSDT,VETUSDT,SANDUSDT,MANAUSDT,THETAUSDT,AXSUSDT"
+# The 37 contracts added to the twelve from the 12 October 2026 cycle to stress
+# the data handling and the risk limits in DRY_RUN (a 49-contract basket). There
+# is no historical measurement behind them. Names are the contract names on
+# Binance USDT-M Futures (1000PEPEUSDT, not PEPEUSDT; RENDER, A and S are the
+# successors of RNDR, EOS and FTM).
+STRESS_TEST_FUTURES_BASKET = (
+    "NEARUSDT,ATOMUSDT,UNIUSDT,BCHUSDT,ETCUSDT,FILUSDT,ICPUSDT,VETUSDT,SANDUSDT,MANAUSDT,THETAUSDT,AXSUSDT"
     ",AAVEUSDT,AUSDT,INJUSDT,RENDERUSDT,OPUSDT,ARBUSDT,APTUSDT,SUIUSDT,FETUSDT,TIAUSDT,SEIUSDT,GALAUSDT,STXUSDT"
     ",KASUSDT,LDOUSDT,IMXUSDT,1000PEPEUSDT,1000SHIBUSDT,WIFUSDT,1000FLOKIUSDT,1000BONKUSDT,SNXUSDT,GRTUSDT"
     ",RUNEUSDT,SUSDT"
 )
+# Default basket of the daily cycle: the twelve measured coins. The 49-contract
+# basket comes back with BOT_FUTURES__SYMBOLS = MEASURED_FUTURES_BASKET + "," + STRESS_TEST_FUTURES_BASKET.
+DEFAULT_FUTURES_BASKET = MEASURED_FUTURES_BASKET
 
 
 class FuturesSettings(BaseModel):

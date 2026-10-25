@@ -190,12 +190,15 @@ from them can only be confirmed forward.
 | Period | What ran |
 |---|---|
 | 8–11 October 2026 | Daily 20/10 breakout on the twelve-coin basket, DRY_RUN on Binance USDT-M Futures. Four cycles, no breakout, no trade. |
-| From 12 October 2026 | Same rule on 49 contracts (the twelve plus 37 more), as a stress test of data handling and risk limits. Its first cycle bought three coins. |
+| 12–25 October 2026 | Same rule on 49 contracts (the twelve plus 37 more), as a stress test of data handling and risk limits. Six trades, all in the 37 added coins and all closed at their stop (−1 R): 9,407.19 USDT out of 10,000. None of the twelve broke out in that time. |
+| From 26 October 2026 | Back to the twelve measured coins, same rule and same paper account (9,407.19 USDT, no open positions). |
 
-The 49-contract basket has no historical measurement behind it, and the study
-above suggests it should do worse than the twelve. We run it anyway for a few
-weeks because it exercises more of the code. What it does in paper trading
-neither confirms nor refutes the twelve-coin result.
+The 49-contract basket had no historical measurement behind it, and the study
+above suggests it should do worse than the twelve. We ran it for two weeks
+because it exercises more of the code. Its six losing trades are far too few
+to judge those coins; the move back to the twelve rests on the study above, not
+on them. What the account does from 26 October is what counts for the
+twelve-coin result.
 
 A few weeks of dry run show that the bot works: cycles on time, orders, stops,
 accounting. They do not show that the strategy makes money. In the history the

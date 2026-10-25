@@ -10,7 +10,7 @@ import pytest
 from loguru import logger
 from pydantic import ValidationError
 
-from config.settings import DEFAULT_FUTURES_BASKET, MEASURED_FUTURES_BASKET, Settings
+from config.settings import DEFAULT_FUTURES_BASKET, MEASURED_FUTURES_BASKET, STRESS_TEST_FUTURES_BASKET, Settings
 from src.data.candle_loader import DailyCandleLoader
 from src.engine import daily_runner
 from src.engine.daily_runner import (
@@ -936,12 +936,17 @@ def _settings(tmp_path: Path, **overrides: Any) -> Settings:
 def test_futures_settings_are_safe_by_default(tmp_path: Path) -> None:
     futures = _settings(tmp_path).futures
     assert futures.execution_mode == "DRY_RUN" and futures.live_trading_acknowledged is False
-    assert futures.symbol_list == DEFAULT_FUTURES_BASKET.split(",") and len(futures.symbol_list) == 49
-    # The twelve measured coins are still in: a position open in them is not left unmanaged.
-    assert futures.symbol_list[:12] == MEASURED_FUTURES_BASKET.split(",")
-    assert len(set(futures.symbol_list)) == 49 and {"1000PEPEUSDT", "RENDERUSDT", "AUSDT", "SUSDT"} <= set(futures.symbol_list)
+    # By default, the twelve measured coins.
+    assert futures.symbol_list == DEFAULT_FUTURES_BASKET.split(",") == MEASURED_FUTURES_BASKET.split(",")
+    assert len(set(futures.symbol_list)) == 12
+    # The 37 stress-test contracts, kept apart and with none of the twelve.
+    stress = STRESS_TEST_FUTURES_BASKET.split(",")
+    assert len(set(stress)) == 37 and not set(stress) & set(futures.symbol_list)
+    assert {"1000PEPEUSDT", "RENDERUSDT", "AUSDT", "SUSDT"} <= set(stress)
     # The names the exchange does not list as a contract: they would be skipped every day.
-    assert not {"PEPEUSDT", "SHIBUSDT", "FLOKIUSDT", "BONKUSDT", "RNDRUSDT", "EOSUSDT", "FTMUSDT", "MKRUSDT"} & set(futures.symbol_list)
+    assert not {"PEPEUSDT", "SHIBUSDT", "FLOKIUSDT", "BONKUSDT", "RNDRUSDT", "EOSUSDT", "FTMUSDT", "MKRUSDT"} & set(stress)
+    wide = _settings(tmp_path, futures={"symbols": MEASURED_FUTURES_BASKET + "," + STRESS_TEST_FUTURES_BASKET}).futures
+    assert len(wide.symbol_list) == 49
     assert (futures.candles, futures.leverage, futures.run_delay_seconds) == (500, 1, 90.0)
     assert (futures.risk_pct, futures.max_position_fraction, futures.max_heat_pct) == (1.0, 0.1, 4.0)
     assert not futures.has_credentials
