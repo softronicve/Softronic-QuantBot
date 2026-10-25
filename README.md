@@ -239,7 +239,7 @@ Everything is set through environment variables or a `.env` file; see
 |---|---|---|
 | `BOT_DRY_RUN` | `true` | Master switch. While true, nothing reaches a real account |
 | `BOT_FUTURES__EXECUTION_MODE` | `DRY_RUN` | `DRY_RUN`, `TESTNET` or `LIVE` |
-| `BOT_FUTURES__SYMBOLS` | 49 contracts | The basket, as Binance contract names (`1000PEPEUSDT`, not `PEPEUSDT`) |
+| `BOT_FUTURES__SYMBOLS` | the twelve measured coins | The basket, as Binance contract names (`1000PEPEUSDT`, not `PEPEUSDT`) |
 | `BOT_FUTURES__RISK_PCT` | `1` | % of the balance at risk per position |
 | `BOT_FUTURES__MAX_POSITION_FRACTION` | `0.1` | Largest position, as a multiple of the balance |
 | `BOT_FUTURES__MAX_HEAT_PCT` | `4` | Largest open risk of the portfolio, in % |
@@ -248,10 +248,11 @@ Everything is set through environment variables or a `.env` file; see
 | `BOT_HEALTHCHECK_PING_URL` | empty | Gets a GET after every completed cycle |
 | `BOT_AUDIT_LLM__ENABLED` | `false` | Answers the report's questions with Claude (needs `BOT_AUDIT_LLM__API_KEY` or `ANTHROPIC_API_KEY`) |
 
-The default basket is the twelve coins the rule was measured on plus 37 more
-that we added to stress the code. The research log explains why the wider
-basket is expected to do worse; `MEASURED_FUTURES_BASKET` in
-`config/settings.py` is the twelve.
+The default basket is the twelve coins the rule was measured on
+(`MEASURED_FUTURES_BASKET` in `config/settings.py`). From 12 to 25 October 2026
+the bot ran on 49 contracts, those twelve plus the 37 in
+`STRESS_TEST_FUTURES_BASKET`, to stress the code. The research log explains why
+the wider basket is expected to do worse.
 
 If you remove a coin from the basket while it has an open position, the cycle
 keeps managing that position (exit channel and stop) until it is closed, and
