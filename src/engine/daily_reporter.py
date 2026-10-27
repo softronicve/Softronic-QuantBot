@@ -109,6 +109,9 @@ class CycleSnapshot:
     closed_trades: Sequence[Mapping[str, Any]] = ()
     # End-of-cycle check that every open position has its stop (``DailyRunner._verify_stops``).
     stop_check: Mapping[str, Any] | None = None
+    # Read-only candles of closed trades' coins that are not in ``market`` (no longer in the basket). They only
+    # fill the post-exit tables: never the decision matrix, the day's observations or any order.
+    settlement_market: Mapping[str, pd.DataFrame] | None = None
 
 
 class DailyReporter:
@@ -227,7 +230,7 @@ class DailyReporter:
             },
             "positions": positions,
             "stopped": list(cycle.stopped),
-            "closed_trades": _settlement(cycle.closed_trades, cycle.market),
+            "closed_trades": _settlement(cycle.closed_trades, {**(cycle.settlement_market or {}), **cycle.market}),
             "stop_check": dict(cycle.stop_check) if cycle.stop_check is not None else None,
             "basket": basket,
             "observations": observations,
@@ -539,6 +542,9 @@ def _trade_excursions(trade: Mapping[str, Any], candles: pd.DataFrame | None) ->
     entry, exit_price, quantity = trade.get("entry_price"), trade.get("exit_price"), trade.get("quantity")
     if risk is None or not isinstance(exit_price, (int, float)):
         return empty
+    if candles is None:
+        # Without its candles only the result is known: the exit price alone would pass for MFE 0 and MAE −1R.
+        return {**empty, "result_r": quantity * (exit_price - entry) / risk}
     highs, lows = [exit_price], [exit_price]
     opened, closed = trade.get("opened_at"), trade.get("closed_at")
     if candles is not None and isinstance(opened, int) and isinstance(closed, int):
@@ -552,11 +558,16 @@ def _trade_excursions(trade: Mapping[str, Any], candles: pd.DataFrame | None) ->
             "giveback_r": mfe - result}
 
 
-def _after_exit(trade: Mapping[str, Any], candles: pd.DataFrame | None) -> dict[str, float | None]:
-    """Change from the exit price to the close a fixed number of days after the exit day; None while pending."""
+def _after_exit(trade: Mapping[str, Any], candles: pd.DataFrame | None) -> dict[str, float | None] | None:
+    """Change from the exit price to the close a fixed number of days after the exit day; None while pending.
+
+    Without the coin's candles there is nothing to wait for: the whole entry is None, not pending.
+    """
     exit_price, closed = trade.get("exit_price"), trade.get("closed_at")
+    if candles is None:
+        return None
     changes: dict[str, float | None] = {str(days): None for days in SETTLEMENT_HORIZONS}
-    if candles is None or not isinstance(exit_price, (int, float)) or not isinstance(closed, int) or not exit_price:
+    if not isinstance(exit_price, (int, float)) or not isinstance(closed, int) or not exit_price:
         return changes
     times = list(candles["open_time"].astype("int64"))
     exit_day = closed - closed % DAY_MS
@@ -1124,9 +1135,7 @@ def _settlement_lines(trades: list[dict[str, Any]]) -> list[str]:
     ]
     lines += [
         f"| {t['symbol']} | {_r(t.get('result_r'))} | {_r(t.get('mfe_r'))} | {_r(t.get('mae_r'))} | "
-        f"{_r(t.get('giveback_r'))} | "
-        + " | ".join(_pct((t.get("after_exit") or {}).get(str(days))) if (t.get("after_exit") or {}).get(str(days))
-                     is not None else "pending" for days in SETTLEMENT_HORIZONS) + " |"
+        f"{_r(t.get('giveback_r'))} | " + " | ".join(_after_exit_cells(t.get("after_exit"))) + " |"
         for t in trades
     ]
     protected = [t["protected_usd"] for t in trades if t.get("protected_usd") is not None]
@@ -1136,6 +1145,14 @@ def _settlement_lines(trades: list[dict[str, Any]]) -> list[str]:
                       f"Taken together, the exits gave up {_usd(-sum(protected))} against holding the positions "
                       "until today."]
     return [*lines, ""]
+
+
+def _after_exit_cells(after: dict[str, float | None] | None) -> list[str]:
+    """One cell per horizon: the change, "pending" while the days have not passed, or — without candles."""
+    if after is None:
+        return ["—"] * len(SETTLEMENT_HORIZONS)
+    return [_pct(after.get(str(days))) if after.get(str(days)) is not None else "pending"
+            for days in SETTLEMENT_HORIZONS]
 
 
 def _regime_lines(observations: dict[str, Any], parameters: dict[str, Any]) -> list[str]:

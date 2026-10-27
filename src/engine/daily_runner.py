@@ -48,7 +48,7 @@ from loguru import logger
 from config.settings import Settings, get_settings
 from src.console import configure_logging
 from src.data.candle_loader import DailyCandleLoader
-from src.engine.daily_reporter import CycleSnapshot, DailyReporter
+from src.engine.daily_reporter import SETTLEMENT_TRADES, CycleSnapshot, DailyReporter
 from src.engine.notifier import Notifier, build_notifier, cycle_message, failure_message
 from src.engine.orchestrator import CLOSE_LONG, OPEN_LONG, BasketOrchestrator, OrderIntent
 from src.engine.post_cycle import LlmAuditor, ping_healthcheck
@@ -390,19 +390,40 @@ class DailyRunner:
         if self._reporter is None:
             return None
         try:
+            closed_trades = self._executor.closed_trades()
             # The account is the one after the orders: the report shows how it ended up.
             return self._reporter.write(CycleSnapshot(
                 cycle_date=summary["cycle_date"], mode=summary["mode"], status=summary["status"],
                 late_minutes=summary["late_minutes"], balance=balance, account=account, positions=positions,
                 market=market, rules=rules, intents=intents, results=results, symbols=symbols,
                 stopped=summary["stopped"], opened_at=self._open_times(positions),
-                closed_trades=self._executor.closed_trades(), stop_check=summary.get("stop_check"),
+                closed_trades=closed_trades, stop_check=summary.get("stop_check"),
+                settlement_market=self._settlement_candles(summary["cycle_date"], closed_trades, market),
             ))
         except BrokerError as error:
             logger.warning("Cycle {}: report not written, {}", summary["cycle_date"], error)
         except Exception:
             logger.exception("Cycle {}: report not written", summary["cycle_date"])
         return None
+
+    def _settlement_candles(
+        self, cycle_date: str, closed_trades: list[dict[str, Any]], market: dict[str, pd.DataFrame],
+    ) -> dict[str, pd.DataFrame]:
+        """Read-only candles of the report's closed trades whose coin is outside the cycle's market.
+
+        They are loaded once the cycle is done, so they never reach the orchestrator: they only fill the
+        post-exit tables of the report. A coin that fails to load just keeps its blanks. Never raises.
+        """
+        missing = sorted({str(trade["symbol"]) for trade in closed_trades[-SETTLEMENT_TRADES:]
+                          if trade.get("symbol") and trade["symbol"] not in market})
+        if not missing:
+            return {}
+        try:
+            return self._loader.load(missing)
+        except BrokerError as error:
+            logger.warning("Cycle {}: no candles for the closed trades outside the basket ({}), {}",
+                           cycle_date, ", ".join(missing), error)
+            return {}
 
     def _exit_channels(
         self, market: dict[str, pd.DataFrame], after: tuple[FuturesAccount, list[FuturesPosition]] | None,
