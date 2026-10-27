@@ -657,6 +657,32 @@ def test_a_symbol_outside_the_basket_stopped_out_on_a_breakout_day_is_not_bought
     assert summary["stopped"] == ["BBBUSDT"] and inside.sent == [("BBBUSDT", OPEN_LONG)]
 
 
+def test_a_coin_closed_outside_the_basket_only_fills_the_post_exit_tables(tmp_path: Path) -> None:
+    import json
+
+    from src.engine.daily_reporter import DailyReporter
+    from src.strategies.trend_breakout import TrendBreakoutStrategy
+
+    reporter = DailyReporter(tmp_path / "reports", TrendBreakoutStrategy(), PortfolioRiskManager())
+    rig = Rig(_client({"AAAUSDT": QUIET, "BBBUSDT": BREAKS}), tmp_path, basket=["AAAUSDT"], reporter=reporter)
+    rig.paper.open("BBBUSDT", 5.0, 100.0, 95.0, NOW_MS - 3 * DAY_MS)
+    rig.paper.close("BBBUSDT", 96.0, "STOP", NOW_MS - 2 * DAY_MS)  # closed while the basket was wider
+    before = len(rig.client.sent("futures_klines"))
+    summary = rig.run()
+
+    # Its candles are read after the cycle, for the report only: it breaks out today and is still not bought.
+    assert rig.sent == [] and summary["opens"] == [] and summary["symbols_with_data"] == 1
+    assert [call["symbol"] for call in rig.client.sent("futures_klines")[before:]] == ["AAAUSDT", "BBBUSDT"]
+    report = json.loads(next((tmp_path / "reports").glob("daily_audit_*.json")).read_text())
+    (trade,) = report["closed_trades"]
+    assert trade["symbol"] == "BBBUSDT" and trade["close_today"] == BREAKS
+    assert trade["protected_usd"] == pytest.approx(5.0 * (96.0 - BREAKS))
+    assert trade["mfe_r"] is not None and trade["after_exit"] is not None
+    # Never part of the decision matrix or the day's observations.
+    assert [row["symbol"] for row in report["basket"]] == ["AAAUSDT"]
+    assert {item["symbol"] for item in report["observations"]["volatility"]} == {"AAAUSDT"}
+
+
 def test_when_the_risk_runs_out_the_strongest_breakouts_win_wherever_they_are_in_the_basket(tmp_path: Path) -> None:
     # The basket goes from the weakest breakout to the strongest, and the open risk only fits two.
     client = _client({"AAAUSDT": 103.5, "BBBUSDT": 105.0, "CCCUSDT": 108.0})

@@ -204,6 +204,8 @@ from src.engine.daily_reporter import (  # noqa: E402
     TURBULENCE_LOOKBACK,
     _after_exit,
     _edge_ratio,
+    _settlement,
+    _settlement_lines,
     _trade_excursions,
     _turbulence,
     trade_quality,
@@ -282,3 +284,14 @@ def test_the_report_shows_the_new_quality_figures(tmp_path: Path) -> None:
     markdown = render_markdown(_reporter(tmp_path).build(_snapshot(closed_trades=trades)))
     assert "How each trade went" in markdown and "| DDDUSDT | -1.00R |" in markdown
     assert f"SQN n/a (n = 1 < {MEANINGFUL_TRADES})" in markdown and "not evidence" in markdown
+
+
+def test_a_closed_trade_without_candles_shows_blanks_not_a_made_up_excursion() -> None:
+    trade = {"symbol": "OLDUSDT", "quantity": 2.0, "entry_price": 100.0, "stop_price": 95.0, "exit_price": 95.0,
+             "opened_at": 1_000, "closed_at": 2_000, "pnl": -10.5, "reason": "STOP"}
+    (settled,) = _settlement([trade], {})
+    assert settled["result_r"] == pytest.approx(-1.0)
+    assert settled["mfe_r"] is settled["mae_r"] is settled["giveback_r"] is settled["after_exit"] is None
+    assert settled["close_today"] is settled["protected_usd"] is None
+    row = next(line for line in _settlement_lines([settled]) if line.startswith("| OLDUSDT | -1.00R"))
+    assert row == "| OLDUSDT | -1.00R | — | — | — | — | — | — |"  # not "+0.00R" nor "pending"
